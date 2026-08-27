@@ -89,7 +89,8 @@ class _ContextGeometry:
     num_qo_heads: int
     num_kv_heads: int
     head_dim: int
-    q_dtype: torch.dtype
+    qk_dtype: torch.dtype
+    pv_dtype: torch.dtype
     output_dtype: torch.dtype
     mask_type: str
     window_left: int
@@ -118,7 +119,8 @@ class _PagedContextGeometry:
     num_qo_heads: int
     num_kv_heads: int
     head_dim: int
-    q_dtype: torch.dtype
+    qk_dtype: torch.dtype
+    pv_dtype: torch.dtype
     output_dtype: torch.dtype
     mask_type: str
     window_left: int
@@ -186,11 +188,17 @@ def _dtype_key(dtype: torch.dtype) -> str:
 
 def _validate_qkv_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
     _dtype_key(q.dtype)
-    if k.dtype != q.dtype or v.dtype != q.dtype:
+    if q.dtype != k.dtype:
         raise NotImplementedError(
-            "attention-ts context requires Q, K, and V to use the same dtype; "
-            f"got Q {q.dtype}, K {k.dtype}, and V {v.dtype}"
-        )
+            "attention-ts context requires Q, K to use the same dtype; "
+            f"got Q {q.dtype}, K {k.dtype}")
+    if q.dtype != torch.bfloat16 or v.dtype != torch.float8_e4m3fn:
+        if k.dtype != q.dtype or v.dtype != q.dtype:
+            raise NotImplementedError(
+                "attention-ts context requires Q, K, and V to use the same dtype "
+                "except for QK-BF16/PV-FP8; "
+                f"got Q {q.dtype}, K {k.dtype}, and V {v.dtype}"
+            )
 
 
 def _validate_output_dtype(output_dtype: torch.dtype) -> None:
@@ -715,7 +723,8 @@ def _resolve_geometry(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=q_head_dim,
-        q_dtype=q.dtype,
+        qk_dtype=q.dtype,
+        pv_dtype=v.dtype,
         output_dtype=output_dtype,
         mask_type=mask_type,
         window_left=window_left,
@@ -908,7 +917,8 @@ def _resolve_paged_geometry(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=q_head_dim,
-        q_dtype=q.dtype,
+        qk_dtype=q.dtype,
+        pv_dtype=v_cache.dtype,
         output_dtype=output_dtype,
         mask_type=mask_type,
         window_left=window_left,
@@ -936,7 +946,8 @@ def _semantic_key(geometry: _ContextGeometry) -> tuple[object, ...]:
         geometry.num_qo_heads,
         geometry.num_kv_heads,
         geometry.head_dim,
-        _dtype_key(geometry.q_dtype),
+        _dtype_key(geometry.qk_dtype),
+        _dtype_key(geometry.pv_dtype),
         _dtype_key(geometry.output_dtype),
         geometry.mask_type,
         geometry.window_left,
@@ -962,7 +973,8 @@ def _paged_semantic_key(
         geometry.num_qo_heads,
         geometry.num_kv_heads,
         geometry.head_dim,
-        _dtype_key(geometry.q_dtype),
+        _dtype_key(geometry.qk_dtype),
+        _dtype_key(geometry.pv_dtype),
         _dtype_key(geometry.output_dtype),
         geometry.mask_type,
         geometry.window_left,
@@ -982,7 +994,8 @@ def _get_compiled_context(
     num_qo_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    q_dtype_key: str,
+    qk_dtype_key: str,
+    pv_dtype_key: str,
     output_dtype_key: str,
     mask_type: str,
     window_left: int,
@@ -1007,7 +1020,8 @@ def _get_compiled_context(
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
     }
-    input_dtype = dtype_map[q_dtype_key]
+    input_qk_dtype = dtype_map[qk_dtype_key]
+    input_pv_dtype = dtype_map[pv_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
     is_causal = mask_type == "causal"
     # Construct the scheduler-independent topology first. Immutable
@@ -1016,7 +1030,8 @@ def _get_compiled_context(
     fmha = FmhaTs(
         qk_acc_dtype=cutlass.Float32,
         pv_acc_dtype=cutlass.Float32,
-        in_dtype=input_dtype,
+        in_qk_dtype=input_qk_dtype,
+        in_pv_dtype=input_pv_dtype,
         out_dtype=output_dtype,
         d=head_dim,
         is_persistent=True,
@@ -1062,7 +1077,8 @@ def _get_compiled_context(
         fmha = FmhaTs(
             qk_acc_dtype=cutlass.Float32,
             pv_acc_dtype=cutlass.Float32,
-            in_dtype=input_dtype,
+            in_qk_dtype=input_qk_dtype,
+            in_pv_dtype=input_pv_dtype,
             out_dtype=output_dtype,
             d=head_dim,
             is_persistent=True,
@@ -1078,7 +1094,8 @@ def _get_compiled_context(
         fmha = FmhaTs(
             qk_acc_dtype=cutlass.Float32,
             pv_acc_dtype=cutlass.Float32,
-            in_dtype=input_dtype,
+            in_qk_dtype=input_qk_dtype,
+            in_pv_dtype=input_pv_dtype,
             out_dtype=output_dtype,
             d=head_dim,
             is_persistent=False,
@@ -1174,9 +1191,9 @@ def _get_compiled_context(
         kv_shape = (batch_size, max_seq_len_k, num_kv_heads, head_dim)
         out_shape = q_shape
         indptr_shape = (1,)
-    q_fake = fake_compact(input_dtype, q_shape, 16)
-    k_fake = fake_compact(input_dtype, kv_shape, 16)
-    v_fake = fake_compact(input_dtype, kv_shape, 16)
+    q_fake = fake_compact(input_qk_dtype, q_shape, 16)
+    k_fake = fake_compact(input_qk_dtype, kv_shape, 16)
+    v_fake = fake_compact(input_pv_dtype, kv_shape, 16)
     out_fake = fake_compact(output_dtype, out_shape, 16)
     scale_fake = fake_compact(cutlass.Float32, (1,), 4)
     output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
@@ -1228,7 +1245,8 @@ def _get_compiled_paged_context(
     num_qo_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    q_dtype_key: str,
+    qk_dtype_key: str,
+    pv_dtype_key: str,
     output_dtype_key: str,
     mask_type: str,
     window_left: int,
@@ -1251,7 +1269,8 @@ def _get_compiled_paged_context(
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
     }
-    input_dtype = dtype_map[q_dtype_key]
+    input_qk_dtype = dtype_map[qk_dtype_key]
+    input_pv_dtype = dtype_map[pv_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
     is_causal = mask_type == "causal"
     with torch.cuda.device(device_index):
@@ -1264,7 +1283,8 @@ def _get_compiled_paged_context(
     fmha = FmhaTs(
         qk_acc_dtype=cutlass.Float32,
         pv_acc_dtype=cutlass.Float32,
-        in_dtype=input_dtype,
+        in_qk_dtype=input_qk_dtype,
+        in_pv_dtype=input_pv_dtype,
         out_dtype=output_dtype,
         d=head_dim,
         is_persistent=True,
@@ -1315,7 +1335,8 @@ def _get_compiled_paged_context(
         fmha = FmhaTs(
             qk_acc_dtype=cutlass.Float32,
             pv_acc_dtype=cutlass.Float32,
-            in_dtype=input_dtype,
+            in_qk_dtype=input_qk_dtype,
+            in_pv_dtype=input_pv_dtype,
             out_dtype=output_dtype,
             d=head_dim,
             is_persistent=True,
@@ -1334,7 +1355,8 @@ def _get_compiled_paged_context(
         fmha = FmhaTs(
             qk_acc_dtype=cutlass.Float32,
             pv_acc_dtype=cutlass.Float32,
-            in_dtype=input_dtype,
+            in_qk_dtype=input_qk_dtype,
+            in_pv_dtype=input_pv_dtype,
             out_dtype=output_dtype,
             d=head_dim,
             is_persistent=False,
@@ -1407,15 +1429,15 @@ def _get_compiled_paged_context(
 
     runtime_total_q = cute.sym_int()
     runtime_num_pages = cute.sym_int()
-    q_fake = fake_compact(input_dtype, (runtime_total_q, num_qo_heads, head_dim), 16)
+    q_fake = fake_compact(input_qk_dtype, (runtime_total_q, num_qo_heads, head_dim), 16)
     kv_shape = (
         runtime_num_pages,
         num_kv_heads,
         page_size,
         head_dim,
     )
-    k_fake = fake_compact(input_dtype, kv_shape, 16)
-    v_fake = fake_compact(input_dtype, kv_shape, 16)
+    k_fake = fake_compact(input_qk_dtype, kv_shape, 16)
+    v_fake = fake_compact(input_pv_dtype, kv_shape, 16)
     out_fake = fake_compact(output_dtype, (runtime_total_q, num_qo_heads, head_dim), 16)
     scale_fake = fake_compact(cutlass.Float32, (1,), 4)
     output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
@@ -1479,8 +1501,12 @@ def _validate_runtime_inputs(
     _validate_base_tensors(q, k, v)
     if q.device != geometry.device:
         raise ValueError(f"q must be on {geometry.device}, got {q.device}")
-    if q.dtype != geometry.q_dtype:
-        raise ValueError(f"q must have dtype {geometry.q_dtype}, got {q.dtype}")
+    if q.dtype != geometry.qk_dtype:
+        raise ValueError(f"q must have dtype {geometry.qk_dtype}, got {q.dtype}")
+    if k.dtype != geometry.qk_dtype:
+        raise ValueError(f"k must have dtype {geometry.qk_dtype}, got {k.dtype}")
+    if v.dtype != geometry.pv_dtype:
+        raise ValueError(f"v must have dtype {geometry.pv_dtype}, got {v.dtype}")
     if tuple(q.shape) != geometry.q_shape:
         raise ValueError(f"q must have shape {geometry.q_shape}, got {tuple(q.shape)}")
     if tuple(k.shape) != geometry.kv_shape:
@@ -1503,8 +1529,16 @@ def _validate_paged_runtime_inputs(
     _validate_base_tensors(q, k_cache, v_cache)
     if q.device != geometry.device:
         raise ValueError(f"q must be on {geometry.device}, got {q.device}")
-    if q.dtype != geometry.q_dtype:
-        raise ValueError(f"q must have dtype {geometry.q_dtype}, got {q.dtype}")
+    if q.dtype != geometry.qk_dtype:
+        raise ValueError(f"q must have dtype {geometry.qk_dtype}, got {q.dtype}")
+    if k_cache.dtype != geometry.qk_dtype:
+        raise ValueError(
+            f"k_cache must have dtype {geometry.qk_dtype}, got {k_cache.dtype}"
+        )
+    if v_cache.dtype != geometry.pv_dtype:
+        raise ValueError(
+            f"v_cache must have dtype {geometry.pv_dtype}, got {v_cache.dtype}"
+        )
     if tuple(q.shape) != geometry.q_shape:
         raise ValueError(f"q must have shape {geometry.q_shape}, got {tuple(q.shape)}")
     if tuple(k_cache.shape) != geometry.kv_shape:

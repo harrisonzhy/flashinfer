@@ -774,7 +774,8 @@ def test_attention_ts_context_d256_pipeline_policy_is_semantic_and_capacity_safe
     """Every D256 topology provides enough stages for its K/V cadence."""
 
     kernel = FmhaTs(
-        in_dtype=input_dtype,
+        in_qk_dtype=input_dtype,
+        in_pv_dtype=input_dtype,
         out_dtype=output_dtype,
         d=256,
         is_persistent=True,
@@ -826,7 +827,8 @@ def test_attention_ts_context_page_window_fits_static_geometry_and_capacity(
     """The wider page-ID handoff is selected only when its SMEM ring fits."""
 
     cfg = FmhaTs(
-        in_dtype=input_dtype,
+        in_qk_dtype=input_dtype,
+        in_pv_dtype=input_dtype,
         out_dtype=BFloat16,
         d=256,
         is_persistent=True,
@@ -1011,7 +1013,8 @@ def test_attention_ts_context_d128_paged_clc_task_graph_is_safe(
     """The paired D128 CLC graph is valid without a page-ID ring."""
 
     kernel = FmhaTs(
-        in_dtype=input_dtype,
+        in_qk_dtype=input_dtype,
+        in_pv_dtype=input_dtype,
         out_dtype=Float16,
         d=128,
         is_persistent=True,
@@ -1067,7 +1070,8 @@ def test_attention_ts_context_d256_live_paged_clc_uses_distinct_auxiliary_warps(
 ):
     """The live-ragged D256 CLC and page-ID producers cannot overlap."""
     kernel = FmhaTs(
-        in_dtype=input_dtype,
+        in_qk_dtype=input_dtype,
+        in_pv_dtype=input_dtype,
         out_dtype=Float16,
         d=256,
         is_persistent=True,
@@ -1146,7 +1150,8 @@ def test_attention_ts_context_d256_uniform_paged_static_scheduler_is_safe(
 
     balance_causal_workload = not has_q_offset
     kernel = FmhaTs(
-        in_dtype=input_dtype,
+        in_qk_dtype=input_dtype,
+        in_pv_dtype=input_dtype,
         out_dtype=Float16,
         d=256,
         is_persistent=True,
