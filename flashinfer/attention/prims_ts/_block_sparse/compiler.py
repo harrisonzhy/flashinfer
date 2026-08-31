@@ -236,8 +236,8 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             key.num_kv_heads,
             key.head_dim,
         )
-        k_fake = fake_compact(config.kv_dtype, kv_shape, 16)
-        v_fake = fake_compact(config.kv_dtype, kv_shape, 16)
+        k_fake = fake_compact(config.k_dtype, kv_shape, 16)
+        v_fake = fake_compact(config.v_dtype, kv_shape, 16)
         tensor_adapter = contiguous_tensor_adapter
         dynamic_args = (
             q_fake,
@@ -265,7 +265,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             key.head_dim,
         )
         k_fake = cute.runtime.make_fake_tensor(
-            config.kv_dtype,
+            config.k_dtype,
             kv_shape,
             stride=(
                 k_outer_stride,
@@ -276,7 +276,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             assumed_align=16,
         )
         v_fake = cute.runtime.make_fake_tensor(
-            config.kv_dtype,
+            config.v_dtype,
             kv_shape,
             stride=(
                 v_outer_stride,
