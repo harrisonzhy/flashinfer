@@ -1146,11 +1146,15 @@ def build_context_task_manager(
     if cfg.p_in_smem:
         smem_p_resources = [
             SmemPResource(
+                # Under two-CTA UMMA the leader's M=256 PV reads both CTAs' P
+                # tiles, so both softmax groups signal the leader's barrier and
+                # the UMMA commit releases both.
                 pipeline_config=PipelineConfig.create_async_umma_pipeline_cfg(
                     num_stages=1,
-                    producer_group=softmax_group,
+                    producer_group=softmax_group_umma if two_cta else softmax_group,
                     consumer_group=umma_hw_group,
                     cta_layout_vmnk=cluster_shape_vmnk,
+                    **tma_umma_leader_kwargs,
                 ),
                 cfg=cfg,
                 group_idx=index,
@@ -2095,14 +2099,10 @@ def _configure_single_instance_warp_layout(cfg: FmhaConfig) -> None:
 
 def _uses_smem_p(cfg: FmhaConfig, *, has_variable_window: bool) -> bool:
     """Stage fp8 P in SMEM for the dense query-paired schedule: needs a 128-byte
-    P row, one SW128 atom, and an O tile stageable in 64-wide halves.
-
-    Not under two-CTA UMMA: the SMEM P-ready handoff is CTA-local, while the
-    leader's M=256 PV reads both CTAs' P tiles, so that form keeps P in TMEM
-    where the cluster-scope P-prefix pipeline already orders it."""
+    P row, one SW128 atom, and an O tile stageable in 64-wide halves. Under
+    two-CTA UMMA the P-ready barrier is cluster-level like the P-prefix one."""
     return (
         not cfg.single_qkv_instance
-        and not cfg.two_cta_umma
         and cfg.v_dtype.width == 8
         and cfg.qk_mma_tiler[1] * cfg.v_dtype.width // 8 == 128
         and cfg.epi_tile[1] % 64 == 0
@@ -2850,7 +2850,7 @@ class FmhaTs:
             cfg.num_regs_correction = 88
             cfg.num_regs_other = 56
         cfg.enable_skip_correction = enable_skip_correction
-        if enable_skip_correction and v_dtype.width == 16:
+        if enable_skip_correction:
             cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
         cfg.uses_ldtm_stat = uses_ldtm_stat
         cfg.exp2_fma_pairs = exp2_fma_pairs
