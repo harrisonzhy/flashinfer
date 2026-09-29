@@ -112,6 +112,10 @@ SoftmaxRowSumContribution: TypeAlias = SoftmaxChunks | SoftmaxScalar
 _tmem_sp_sdata: dict[int, list] = {}
 # Packed fp8 P words carried from exp2_p to store_p when P is staged in SMEM.
 _tmem_sp_pwords: dict[int, tuple] = {}
+# State carried from exp2_p_fenced to exp2_p_fenced_tail. Row sums are passed as
+# plain values. Updating them inside a shared container made the compiler treat
+# them as loop-carried, so they were not reset between tiles.
+_tmem_sp_fenced_state: dict[int, tuple] = {}
 
 
 @cute.jit
@@ -188,6 +192,18 @@ def _pack_float4_to_fp8_e4m3(
 # polynomial's dependent arithmetic costs more issue slots than it saves on MUFU.
 _FP8_EXP2_FMA_PAIRS_PER_CHUNK = 3
 
+# ptxas scheduling hints. Only some DSL builds expose them under cute.nvgpu.
+_HAS_SCHED_KNOBS = hasattr(getattr(cute, "nvgpu", None), "cfence")
+
+# Fenced exp2 order for fp8 P in SMEM. For each exp2 pair the thread first adds
+# the pair 8 elements behind to the row sum and packs it to e4m3. It then scales
+# the pair 8 elements ahead. Each exp2 sits between two fences so ptxas keeps
+# this order. The S0-S1 token is passed to the other softmax group 4 elements
+# before the last MUFU exp2.
+_FENCED_EXP2_LOOKAHEAD = 8
+_FENCED_EXP2_RETIRE_LAG = 8
+_FENCED_EXP2_HANDOFF_EARLY = 4
+
 
 @cute.jit
 def _f32_bits(x: Float32) -> Int32:
@@ -209,7 +225,11 @@ def _exp2_fma_packed(x0: Float32, x1: Float32) -> tuple[Float32, Float32]:
     # Adding 1.5 * 2^23 with round-down leaves floor(x) in the low mantissa bits.
     bias = Float32(1.5 * 2.0**23)
     t = cute.arch.add_packed_f32x2((x0, x1), (bias, bias), rnd="rm", ftz=False)
+    if _HAS_SCHED_KNOBS:
+        cute.nvgpu.warp_switch()
     n = cute.arch.add_packed_f32x2(t, (-bias, -bias), rnd="rn", ftz=False)
+    if _HAS_SCHED_KNOBS:
+        cute.nvgpu.warp_switch()
     f = cute.arch.fma_packed_f32x2(
         n, (Float32(-1.0), Float32(-1.0)), (x0, x1), rnd="rn", ftz=False
     )
@@ -227,6 +247,64 @@ def _exp2_fma_packed(x0: Float32, x1: Float32) -> tuple[Float32, Float32]:
         _f32_from_bits(_f32_bits(p[0]) + (_f32_bits(t[0]) << 23)),
         _f32_from_bits(_f32_bits(p[1]) + (_f32_bits(t[1]) << 23)),
     )
+
+
+def _fenced_exp2_pairs(
+    begin: int,
+    end: int,
+    n: int,
+    n_mufu: int,
+    s,
+    x,
+    p,
+    words,
+    sums,
+    scale,
+    minus_row_max_scale,
+):
+    """Run the fenced exp2 order for element pairs in [begin, end).
+
+    Pairs below n_mufu use MUFU exp2 and the rest use the FMA emulation. Pairs
+    at or past n only retire. Returns the updated scaled scores, P values,
+    packed words and row sums."""
+    for i in range(begin, end, 2):
+        j = i - _FENCED_EXP2_RETIRE_LAG
+        if 0 <= j < n:
+            k = (j // 2) % len(sums)
+            sums = (
+                sums[:k]
+                + (
+                    cute.arch.add_packed_f32x2(
+                        sums[k], (p[j], p[j + 1]), rnd="rn", ftz=False
+                    ),
+                )
+                + sums[k + 1 :]
+            )
+        if i < n_mufu:
+            cute.nvgpu.cfence()
+            p0 = cute.math.exp2(x[i], fastmath=True)
+            cute.nvgpu.cfence()
+        if i + _FENCED_EXP2_LOOKAHEAD < n:
+            a = i + _FENCED_EXP2_LOOKAHEAD
+            x += cute.arch.fma_packed_f32x2(
+                (s[a], s[a + 1]),
+                (scale, scale),
+                (minus_row_max_scale, minus_row_max_scale),
+                rnd="rn",
+                ftz=False,
+            )
+        if i < n_mufu:
+            cute.nvgpu.cfence()
+            p1 = cute.math.exp2(x[i + 1], fastmath=True)
+            cute.nvgpu.cfence()
+            if i + 2 == n_mufu:
+                cute.nvgpu.reset_sched_res_busy_xu64()
+            p += (p0, p1)
+        elif i < n:
+            p += _exp2_fma_packed(x[i], x[i + 1])
+        if 0 <= j < n and (j + 2) % 4 == 0:
+            words += (_pack_float4_to_fp8_e4m3(p[j - 2], p[j - 1], p[j], p[j + 1]),)
+    return x, p, words, sums
 
 
 def _placeholder_softmax_chunks(cfg: Any) -> SoftmaxChunks:
@@ -539,6 +617,16 @@ class FmhaConfig:
             and self.qk_mma_tiler[1] == self.pv_mma_tiler[2]
             and (self.pv_mma_tiler[2] // (16 if self.v_dtype.width == 16 else 32)) % 2
             == 0
+        )
+
+    @property
+    def uses_smem_p_fp8_fenced_exp2(self) -> bool:
+        """Return whether fp8 P in SMEM uses the fenced exp2 order."""
+        return (
+            self.p_in_smem
+            and self.v_dtype == cutlass.Float8E4M3FN
+            and self.enable_early_tile_sum
+            and _HAS_SCHED_KNOBS
         )
 
     @property
@@ -3990,6 +4078,95 @@ class TmemSPResource(MemoryResource):
             stage_info, s_data, kv_tile_idx=stage_info.loop_offset, q_offset=q_offset
         )
         return self._reduce_row_max(s_data, row_max)
+
+    @consumer_work
+    @cute.jit
+    def exp2_p_fenced(
+        self,
+        stage_info: StageInfo,
+        *,
+        row_max: SoftmaxScalar,
+        scale_softmax_log2: SoftmaxScalar,
+    ) -> None:
+        """Run the fenced exp2 order up to the S0-S1 handoff point."""
+        _ = stage_info
+        scale = scale_softmax_log2
+        minus_row_max_scale = (Float32(0.0) - row_max) * scale + Float32(
+            self.cfg.pv_p_scale_log2
+        )
+        tmem_x = self.cfg.tmem_x_load_s
+        num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
+        n = tmem_x * num_chunks
+        n_mufu = n - 2 * _FP8_EXP2_FMA_PAIRS_PER_CHUNK * num_chunks
+        s_data = _tmem_sp_sdata.pop(id(self))
+        s: tuple[Any, ...] = ()
+        for chunk_idx in cutlass.range_constexpr(num_chunks):
+            for elem_idx in cutlass.range_constexpr(tmem_x):
+                s += (s_data[chunk_idx][elem_idx],)
+        x: tuple[Any, ...] = ()
+        for i in cutlass.range_constexpr(0, _FENCED_EXP2_LOOKAHEAD, 2):
+            x += cute.arch.fma_packed_f32x2(
+                (s[i], s[i + 1]),
+                (scale, scale),
+                (minus_row_max_scale, minus_row_max_scale),
+                rnd="rn",
+                ftz=False,
+            )
+        zero = (Float32(0.0), Float32(0.0))
+        cute.nvgpu.sched_res_busy_xu64()
+        x, p, words, sums = _fenced_exp2_pairs(
+            0,
+            n_mufu - _FENCED_EXP2_HANDOFF_EARLY,
+            n,
+            n_mufu,
+            s,
+            x,
+            (),
+            (),
+            (zero, zero, zero, zero),
+            scale,
+            minus_row_max_scale,
+        )
+        _tmem_sp_fenced_state[id(self)] = (
+            n,
+            n_mufu,
+            s,
+            x,
+            p,
+            words,
+            sums,
+            scale,
+            minus_row_max_scale,
+        )
+
+    @consumer_work(returns=p_chunk)
+    @cute.jit
+    def exp2_p_fenced_tail(self, stage_info: StageInfo) -> SoftmaxRowSumContribution:
+        """Finish the fenced exp2 order and return the tile row sum."""
+        _ = stage_info
+        n, n_mufu, s, x, p, words, sums, scale, minus_row_max_scale = (
+            _tmem_sp_fenced_state.pop(id(self))
+        )
+        _, _, words, sums = _fenced_exp2_pairs(
+            n_mufu - _FENCED_EXP2_HANDOFF_EARLY,
+            n + _FENCED_EXP2_RETIRE_LAG,
+            n,
+            n_mufu,
+            s,
+            x,
+            p,
+            words,
+            sums,
+            scale,
+            minus_row_max_scale,
+        )
+        _tmem_sp_pwords[id(self)] = words
+        sum_0 = cute.arch.add_packed_f32x2(sums[0], sums[2], rnd="rn", ftz=False)
+        sum_1 = cute.arch.add_packed_f32x2(sums[1], sums[3], rnd="rn", ftz=False)
+        total = cute.arch.add_packed_f32x2(sum_0, sum_1, rnd="rn", ftz=False)
+        tile_sum = total[0] + total[1]
+        cute.arch.fence_view_async_tmem_store()
+        return tile_sum
 
     @consumer_work
     @cute.jit

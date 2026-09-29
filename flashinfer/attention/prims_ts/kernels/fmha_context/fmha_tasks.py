@@ -2222,14 +2222,35 @@ def create_softmax_task(
             p_chunk = sp.init_softmax_state()
         scale_softmax_log2 = sp.load_scale_softmax_log2()
 
+        def hand_off_seq() -> None:
+            """Pass the S0-S1 pacing token to the peer softmax group."""
+            if index == 0:
+                seq.commit()
+            else:
+                seq.release()
+
+        # These two paths hand the token off inside exp2_p instead.
+        hand_off_after_exp2 = s0s1_seq is not None and not (
+            tmem_sp.cfg.uses_d128_fp8_softmax_cadence
+            or tmem_sp.cfg.uses_smem_p_fp8_fenced_exp2
+        )
+
         def exp2_p(sp: TmemSPResource, *, row_max: Any, scale_softmax_log2: Any) -> Any:
             """Softmax and P store. With P in SMEM the store goes to the SMEM P tile,
             with the half overlap the leading half is published behind ``pr``, else P goes
-            to the TMEM S/P stage."""
+            to the TMEM S/P stage. The fenced exp2 path hands the S0-S1 token off
+            before its tail."""
             if p_in_smem:
-                p_chunk = sp.exp2_p(
-                    row_max=row_max, scale_softmax_log2=scale_softmax_log2
-                )
+                if tmem_sp.cfg.uses_smem_p_fp8_fenced_exp2:
+                    sp.exp2_p_fenced(
+                        row_max=row_max, scale_softmax_log2=scale_softmax_log2
+                    )
+                    hand_off_seq()
+                    p_chunk = sp.exp2_p_fenced_tail()
+                else:
+                    p_chunk = sp.exp2_p(
+                        row_max=row_max, scale_softmax_log2=scale_softmax_log2
+                    )
                 pb.acquire()
                 sp.store_p()
                 pb.commit()
@@ -2317,22 +2338,15 @@ def create_softmax_task(
                 # FP8 returns the pacing token before P work. Its SP release
                 # still follows every P store's completion.
                 if tmem_sp.cfg.uses_d128_fp8_softmax_cadence:
-                    if index == 0:
-                        seq.commit()
-                    else:
-                        seq.release()
+                    hand_off_seq()
                 # Apply softmax and write P.
                 p_chunk = exp2_p(
                     sp,
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
-                if s0s1_seq is None or tmem_sp.cfg.uses_d128_fp8_softmax_cadence:
-                    pass
-                elif index == 0:
-                    seq.commit()
-                else:
-                    seq.release()
+                if hand_off_after_exp2:
+                    hand_off_seq()
                 if not p_in_smem:
                     sp.release()
                 # Reduction.
@@ -2541,12 +2555,8 @@ def create_softmax_task(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
-                if s0s1_seq is None:
-                    pass
-                elif index == 0:
-                    seq.commit()
-                else:
-                    seq.release()
+                if hand_off_after_exp2:
+                    hand_off_seq()
                 if not p_in_smem:
                     sp.release()
                 row_sum = sp.softmax_aux_reduce(
