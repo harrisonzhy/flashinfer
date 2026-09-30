@@ -5401,10 +5401,16 @@ def test_attention_ts_context_mla_prefill(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("pv_dtype", (torch.bfloat16, _FP8), ids=("pv-bf16", "pv-fp8"))
+@pytest.mark.parametrize(
+    "qk_dtype,pv_dtype",
+    ((torch.bfloat16, torch.bfloat16), (torch.bfloat16, _FP8), (_FP8, _FP8)),
+    ids=("pv-bf16", "pv-fp8", "qkv-fp8"),
+)
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_two_cta_matches_single_cta(monkeypatch, pv_dtype):
+def test_attention_ts_context_two_cta_matches_single_cta(
+    monkeypatch, qk_dtype, pv_dtype
+):
     """The paired kernel reproduces the single-CTA kernel and the reference.
 
     8456 tokens give 33 query tiles per (batch, head): the odd count exercises the
@@ -5419,14 +5425,14 @@ def test_attention_ts_context_two_cta_matches_single_cta(monkeypatch, pv_dtype):
         k_lengths=(8456, 8456),
         num_qo_heads=2,
         num_kv_heads=2,
-        qkv_dtype=torch.bfloat16,
+        qkv_dtype=qk_dtype,
         packed=False,
         mask_type="dense",
         output_dtype=torch.bfloat16,
         output_scale=1.0,
         seed=2026092201,
     )
-    if pv_dtype is _FP8:
+    if pv_dtype is _FP8 and case.v.dtype is not _FP8:
         case = replace(case, v=case.v.to(_FP8))
 
     monkeypatch.setattr(

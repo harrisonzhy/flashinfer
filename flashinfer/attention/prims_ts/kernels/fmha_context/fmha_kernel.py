@@ -2870,11 +2870,11 @@ class FmhaTs:
             or h_r != 1
             or d != 128
             or d_v not in (None, 128)
-            or in_qk_dtype.width != 16
+            or in_qk_dtype.width not in (8, 16)
         ):
             raise ValueError(
                 "two-CTA UMMA requires the non-persistent dense contiguous "
-                "query-paired D128 context kernel with bf16 QK"
+                "query-paired D128 context kernel with bf16 or E4M3 QK"
             )
         cfg.two_cta_umma = two_cta_umma
         if two_cta_umma:
