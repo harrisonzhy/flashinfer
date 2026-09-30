@@ -168,6 +168,11 @@ def _split_bf16_hi_lo_word(value: Float32) -> Int32:
 VC_EXPCAST_BETA = -0.35
 # Ablation switch: False keeps the exact exp2 + E4M3 cast path under VC-Attention.
 VC_EXPCAST = True
+# ExpCast row sum: accumulate the decoded E4M3 probabilities as f16x2 through the
+# hardware e4m3x2 -> f16x2 conversion (2 CVT + 2 HADD2 per quad) instead of the
+# byte-shift decode into fp32 (4 SHL + 2 FADD2 per quad). f16 holds the tile sum
+# exactly in range (<= 128 * 256) and rounds each add to 2^-11.
+VC_EXPCAST_F16_SUM = True
 
 
 @cute.jit
@@ -227,6 +232,129 @@ def _expcast_e4m3_quad(
         }""",
         write_only_types=[Int32, Float32, Float32, Float32, Float32],
         read_only_args=[t0, t1, t2, t3],
+    )
+
+
+@cute.jit
+def _expcast_e4m3_quad_f16acc(
+    t0: Float32,
+    t1: Float32,
+    t2: Float32,
+    t3: Float32,
+    acc01: Int32,
+    acc23: Int32,
+) -> tuple[Int32, Int32, Int32]:
+    """ExpCast four scores into one packed E4M3 word and accumulate their values
+    into two f16x2 row-sum registers.
+
+    ``fma.sat.f32x2`` forms the codes ``sat(8*(s*scale - m) + 56 + beta) / 256``
+    (codes at or above 120 never occur because the exact row max keeps the
+    log2 probability at or below 8), a second packed FMA rounds each code into
+    the low byte of a float and ``prmt`` gathers the bytes. The row sum uses
+    the hardware E4M3-pair to f16x2 conversion of the very bytes the PV MMA
+    consumes (E4M3 values are exact in f16), so it sums the quantized P with
+    no ALU decode; one packed f16 FMA per pair accumulates it.
+    """
+    return cute.arch.inline_ptx(
+        """
+        {
+            .reg .b64 t01, t23, y01, y23, s256, bias2;
+            .reg .b32 b0, b1, b2, b3, w01, w23, h01, h23, a01, a23, r01, r23, one2;
+            .reg .b16 c01, c23, hi01, hi23;
+            mov.b32 one2, 0x3C003C00;
+            mov.b32 a01, {$r4};
+            mov.b32 a23, {$r5};
+            mov.b64 s256, {0f43800000, 0f43800000};
+            mov.b64 bias2, {0f4B400000, 0f4B400000};
+            mov.b64 t01, {{$r0}, {$r1}};
+            mov.b64 t23, {{$r2}, {$r3}};
+            fma.rn.f32x2 y01, t01, s256, bias2;
+            fma.rn.f32x2 y23, t23, s256, bias2;
+            mov.b64 {b0, b1}, y01;
+            mov.b64 {b2, b3}, y23;
+            prmt.b32 w01, b0, b1, 0x0040;
+            prmt.b32 w23, b2, b3, 0x0040;
+            prmt.b32 {$w0}, w01, w23, 0x5410;
+            mov.b32 {c01, hi01}, w01;
+            mov.b32 {c23, hi23}, w23;
+            cvt.rn.f16x2.e4m3x2 h01, c01;
+            cvt.rn.f16x2.e4m3x2 h23, c23;
+            fma.rn.f16x2 r01, h01, one2, a01;
+            fma.rn.f16x2 r23, h23, one2, a23;
+            mov.b32 {$w1}, r01;
+            mov.b32 {$w2}, r23;
+        }""",
+        write_only_types=[Int32, Int32, Int32],
+        read_only_args=[t0, t1, t2, t3, acc01, acc23],
+    )
+
+
+@cute.jit
+def _expcast_e4m3_quad_f16init(
+    t0: Float32,
+    t1: Float32,
+    t2: Float32,
+    t3: Float32,
+) -> tuple[Int32, Int32, Int32]:
+    """First quad of a row-sum chain: as :func:`_expcast_e4m3_quad_f16acc` with
+    zero accumulators (keeps the accumulators runtime values, not immediates)."""
+    return cute.arch.inline_ptx(
+        """
+        {
+            .reg .b64 t01, t23, y01, y23, s256, bias2;
+            .reg .b32 b0, b1, b2, b3, w01, w23;
+            .reg .b16 c01, c23, hi01, hi23;
+            mov.b64 s256, {0f43800000, 0f43800000};
+            mov.b64 bias2, {0f4B400000, 0f4B400000};
+            mov.b64 t01, {{$r0}, {$r1}};
+            mov.b64 t23, {{$r2}, {$r3}};
+            fma.rn.f32x2 y01, t01, s256, bias2;
+            fma.rn.f32x2 y23, t23, s256, bias2;
+            mov.b64 {b0, b1}, y01;
+            mov.b64 {b2, b3}, y23;
+            prmt.b32 w01, b0, b1, 0x0040;
+            prmt.b32 w23, b2, b3, 0x0040;
+            prmt.b32 {$w0}, w01, w23, 0x5410;
+            mov.b32 {c01, hi01}, w01;
+            mov.b32 {c23, hi23}, w23;
+            cvt.rn.f16x2.e4m3x2 {$w1}, c01;
+            cvt.rn.f16x2.e4m3x2 {$w2}, c23;
+        }""",
+        write_only_types=[Int32, Int32, Int32],
+        read_only_args=[t0, t1, t2, t3],
+    )
+
+
+@cute.jit
+def _f16x2_sum4(a0: Int32, a1: Int32, a2: Int32, a3: Int32) -> Float32:
+    """fp32 sum of the eight fp16 halves of four f16x2 registers."""
+    return cute.arch.inline_ptx(
+        """
+        {
+            .reg .b16 h<8>;
+            .reg .f32 f<8>;
+            mov.b32 {h0, h1}, {$r0};
+            mov.b32 {h2, h3}, {$r1};
+            mov.b32 {h4, h5}, {$r2};
+            mov.b32 {h6, h7}, {$r3};
+            cvt.f32.f16 f0, h0;
+            cvt.f32.f16 f1, h1;
+            cvt.f32.f16 f2, h2;
+            cvt.f32.f16 f3, h3;
+            cvt.f32.f16 f4, h4;
+            cvt.f32.f16 f5, h5;
+            cvt.f32.f16 f6, h6;
+            cvt.f32.f16 f7, h7;
+            add.f32 f0, f0, f1;
+            add.f32 f2, f2, f3;
+            add.f32 f4, f4, f5;
+            add.f32 f6, f6, f7;
+            add.f32 f0, f0, f2;
+            add.f32 f4, f4, f6;
+            add.f32 {$w0}, f0, f4;
+        }""",
+        write_only_types=[Float32],
+        read_only_args=[a0, a1, a2, a3],
     )
 
 
@@ -3954,8 +4082,41 @@ class TmemSPResource(MemoryResource):
             (120.0 + VC_EXPCAST_BETA) / 256.0
         )
         s_data = _tmem_sp_sdata.pop(id(self))
-        sum_pairs = [(Float32(0.0), Float32(0.0)) for _ in range(4)]
         packed_words: tuple[Any, ...] = ()
+        if cutlass.const_expr(VC_EXPCAST_F16_SUM):
+            # Two independent f16x2 accumulator pairs (16 pair-adds each per tile).
+            acc: list[Any] = [None] * 4
+            for chunk_idx in cutlass.range_constexpr(num_chunks):
+                for elem_idx in cutlass.range_constexpr(0, tmem_x, 4):
+                    quad_idx = (chunk_idx * tmem_x + elem_idx) // 4
+                    chain = 2 * (quad_idx % 2)
+                    t0 = _fma_sat_f32(
+                        s_data[chunk_idx][elem_idx], code_scale, code_bias
+                    )
+                    t1 = _fma_sat_f32(
+                        s_data[chunk_idx][elem_idx + 1], code_scale, code_bias
+                    )
+                    t2 = _fma_sat_f32(
+                        s_data[chunk_idx][elem_idx + 2], code_scale, code_bias
+                    )
+                    t3 = _fma_sat_f32(
+                        s_data[chunk_idx][elem_idx + 3], code_scale, code_bias
+                    )
+                    if cutlass.const_expr(quad_idx < 2):
+                        word, acc_lo, acc_hi = _expcast_e4m3_quad_f16init(
+                            t0, t1, t2, t3
+                        )
+                    else:
+                        word, acc_lo, acc_hi = _expcast_e4m3_quad_f16acc(
+                            t0, t1, t2, t3, acc[chain], acc[chain + 1]
+                        )
+                    acc[chain] = acc_lo
+                    acc[chain + 1] = acc_hi
+                    packed_words += (word,)
+            _tmem_sp_pwords[id(self)] = packed_words
+            cute.arch.fence_view_async_tmem_store()
+            return _f16x2_sum4(acc[0], acc[1], acc[2], acc[3])
+        sum_pairs = [(Float32(0.0), Float32(0.0)) for _ in range(4)]
         for chunk_idx in cutlass.range_constexpr(num_chunks):
             for elem_idx in cutlass.range_constexpr(0, tmem_x, 4):
                 t0 = _fma_sat_f32(s_data[chunk_idx][elem_idx], code_scale, code_bias)
