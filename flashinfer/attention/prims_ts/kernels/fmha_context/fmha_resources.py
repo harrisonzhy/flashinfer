@@ -235,6 +235,29 @@ def _expcast_e4m3_quad(
     )
 
 
+def _fma_sat_f32x2(
+    a0: Float32, a1: Float32, b: Float32, c: Float32
+) -> tuple[Float32, Float32]:
+    """Packed ``fma.rn.sat.f32x2``: ``(a0*b + c, a1*b + c)`` clamped to [0, 1]."""
+    from cutlass._mlir.dialects import vector as vector_dialect
+
+    vec_type = mlir_ir.VectorType.get([2], Float32.mlir_type)
+    va = vector_dialect.from_elements(vec_type, (a0.ir_value(), a1.ir_value()))
+    vb = vector_dialect.from_elements(vec_type, (b.ir_value(), b.ir_value()))
+    vc = vector_dialect.from_elements(vec_type, (c.ir_value(), c.ir_value()))
+    res = nvvm_dialect.fma(
+        va,
+        vb,
+        vc,
+        rnd=mlir_ir.Attribute.parse("#nvvm.fp_rnd_mode<rn>"),
+        sat=mlir_ir.Attribute.parse("#nvvm.sat_mode<sat>"),
+    )
+    return (
+        Float32(vector_dialect.extract(res, dynamic_position=[], static_position=[0])),
+        Float32(vector_dialect.extract(res, dynamic_position=[], static_position=[1])),
+    )
+
+
 @cute.jit
 def _expcast_e4m3_quad_f16acc(
     t0: Float32,
@@ -4090,17 +4113,17 @@ class TmemSPResource(MemoryResource):
                 for elem_idx in cutlass.range_constexpr(0, tmem_x, 4):
                     quad_idx = (chunk_idx * tmem_x + elem_idx) // 4
                     chain = 2 * (quad_idx % 2)
-                    t0 = _fma_sat_f32(
-                        s_data[chunk_idx][elem_idx], code_scale, code_bias
+                    t0, t1 = _fma_sat_f32x2(
+                        s_data[chunk_idx][elem_idx],
+                        s_data[chunk_idx][elem_idx + 1],
+                        code_scale,
+                        code_bias,
                     )
-                    t1 = _fma_sat_f32(
-                        s_data[chunk_idx][elem_idx + 1], code_scale, code_bias
-                    )
-                    t2 = _fma_sat_f32(
-                        s_data[chunk_idx][elem_idx + 2], code_scale, code_bias
-                    )
-                    t3 = _fma_sat_f32(
-                        s_data[chunk_idx][elem_idx + 3], code_scale, code_bias
+                    t2, t3 = _fma_sat_f32x2(
+                        s_data[chunk_idx][elem_idx + 2],
+                        s_data[chunk_idx][elem_idx + 3],
+                        code_scale,
+                        code_bias,
                     )
                     if cutlass.const_expr(quad_idx < 2):
                         word, acc_lo, acc_hi = _expcast_e4m3_quad_f16init(
