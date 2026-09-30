@@ -134,6 +134,7 @@ class VcKvPass1:
         S: Int32,
         H: Int32,
         T: Int32,
+        BH: Int32,
         HADAMARD: cutlass.Constexpr[bool],
         DEMEAN: cutlass.Constexpr[bool],
     ):
@@ -201,8 +202,16 @@ class VcKvPass1:
         kscale = cute.arch.fmax(kmax / E4M3_MAX, Float32(1e-12))
         kscale_inv = Float32(1.0) / kscale
         if tidx == 0:
+            # Flat scale layout (sage.flat_scale_slot): sequence b of head h starts
+            # at slot (b*S >> 7) + b; numel per head = ceil(B*S / 128) + B - 1.
+            b_idx = bh // H
+            h_idx = bh % H
+            n_batch = BH // H
+            numel = ((n_batch * S + TILE - 1) // TILE) + n_batch - 1
+            slot = ((b_idx * S) // TILE) + b_idx + t
             cutlass.inttoptr(
-                mKScale.iterator.toint() + (Int64(bh) * Int64(T) + t) * 4,
+                mKScale.iterator.toint()
+                + (Int64(h_idx) * Int64(numel) + Int64(slot)) * 4,
                 mem_space=1,
                 dtype=Float32,
             ).store(kscale)
@@ -325,6 +334,7 @@ class VcKvPass1:
             S,
             H,
             T,
+            BH,
             hadamard,
             demean,
         ).launch(
@@ -476,6 +486,7 @@ class VcQPass:
         S: Int32,
         H: Int32,
         NB: Int32,
+        BH: Int32,
         HADAMARD: cutlass.Constexpr[bool],
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -523,8 +534,15 @@ class VcQPass:
         qscale = cute.arch.fmax(qmax / E4M3_MAX, Float32(1e-12))
         qscale_inv = Float32(1.0) / qscale
         if tidx == 0:
+            # Flat scale layout (sage.flat_scale_slot), see the K pass.
+            b_idx = bh // H
+            h_idx = bh % H
+            n_batch = BH // H
+            numel = ((n_batch * S + TILE - 1) // TILE) + n_batch - 1
+            slot = ((b_idx * S) // TILE) + b_idx + nb
             cutlass.inttoptr(
-                mQScale.iterator.toint() + (Int64(bh) * Int64(NB) + nb) * 4,
+                mQScale.iterator.toint()
+                + (Int64(h_idx) * Int64(numel) + Int64(slot)) * 4,
                 mem_space=1,
                 dtype=Float32,
             ).store(qscale)
@@ -557,7 +575,7 @@ class VcQPass:
         hadamard: cutlass.Constexpr[bool],
         stream,
     ):
-        self.kernel(mQ, mQ8, mQScale, S, H, NB, hadamard).launch(
+        self.kernel(mQ, mQ8, mQScale, S, H, NB, BH, hadamard).launch(
             grid=[NB, BH, 1], block=[THREADS, 1, 1], smem=16, stream=stream
         )
 
@@ -653,7 +671,8 @@ def vc_prepare(
     the normalised 128-point Hadamard before quantization; ``demean=False``
     keeps the tile means at zero (V-Smooth off, plain per-channel E4M3 V).
     Returns ``(q8, k8, v8, q_scale, k_scale, v_scale, mean, mu)`` in the
-    :class:`VCAttentionOperands` layouts; ``v_scale`` is ``[B, H, 128]``.
+    :class:`VCAttentionOperands` layouts (Q/K scales in the sage flat layout);
+    ``v_scale`` is ``[B, H, 128]``.
     """
     b, s_k, h, d = k.shape
     s_q = q.shape[1]
@@ -671,8 +690,13 @@ def vc_prepare(
     k8 = torch.empty((b, s_k, h, d), dtype=torch.float8_e4m3fn, device=dev)
     v8 = torch.empty_like(k8)
     q8 = torch.empty((b, s_q, h, d), dtype=torch.float8_e4m3fn, device=dev)
-    k_scale = torch.empty((b, h, t), dtype=torch.float32, device=dev)
-    q_scale = torch.empty((b, h, nbq), dtype=torch.float32, device=dev)
+    # Flat scale layout (sage.flat_scale_numel): [H, ceil(B*S/blk) + B - 1].
+    k_scale = torch.ones(
+        (h, (b * s_k + TILE - 1) // TILE + b - 1), dtype=torch.float32, device=dev
+    )
+    q_scale = torch.ones(
+        (h, (b * s_q + TILE - 1) // TILE + b - 1), dtype=torch.float32, device=dev
+    )
     mean = torch.empty((b, h, t, d), dtype=torch.float32, device=dev)
     vamax = torch.empty((b, h, t, d), dtype=torch.float32, device=dev)
     mu = torch.empty((b, h, t, 8, 256), dtype=torch.bfloat16, device=dev)

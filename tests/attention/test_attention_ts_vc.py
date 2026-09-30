@@ -62,18 +62,9 @@ def _run_vc(batch, seq_len, heads, *, q_block_size=128, seed=0):
         packed=False,
         mask_type="dense",
         sm_scale=sm_scale,
-        vc_attention=True,
-        vc_q_block_size=q_block_size,
+        vc_config=vca.VCAttentionConfig(q_block_size=q_block_size),
     )
-    out = wrapper.run(
-        ops.q,
-        ops.k,
-        ops.v,
-        output_scale=ops.v_scale.reshape(-1).contiguous(),
-        vc_mu=ops.mu,
-        vc_q_scale=ops.q_scale,
-        vc_k_scale=ops.k_scale,
-    )
+    out = wrapper.run(ops.q, ops.k, ops.v, vc=ops.params)
     reference = vca.vc_reference(ops, sm_scale=sm_scale)
     exact = torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
@@ -174,7 +165,7 @@ def test_vc_plan_rejects_unsupported_recipes():
         num_kv_heads=1,
         head_dim=128,
         out_dtype=torch.bfloat16,
-        vc_attention=True,
+        vc_config=vca.VCAttentionConfig(),
     )
     with pytest.raises(NotImplementedError):
         wrapper.plan(
@@ -192,13 +183,119 @@ def test_vc_plan_rejects_unsupported_recipes():
             **common,
         )
     with pytest.raises(ValueError):
-        wrapper.plan(
-            q_dtype=torch.float8_e4m3fn,
-            k_dtype=torch.float8_e4m3fn,
-            v_dtype=torch.float8_e4m3fn,
-            vc_q_block_size=96,
-            **common,
+        vca.VCAttentionConfig(q_block_size=96)
+    fp8 = dict(
+        q_dtype=torch.float8_e4m3fn,
+        k_dtype=torch.float8_e4m3fn,
+        v_dtype=torch.float8_e4m3fn,
+    )
+    plain = {k: v for k, v in common.items() if k != "vc_config"}
+    with pytest.raises(TypeError):
+        wrapper.plan(vc_config={"q_block_size": 128}, **fp8, **plain)
+    # Compatibility spelling keeps its checks.
+    with pytest.raises(ValueError):
+        wrapper.plan(vc_attention=True, vc_q_block_size=96, **fp8, **plain)
+    with pytest.raises(TypeError):
+        wrapper.plan(vc_attention=1, **fp8, **plain)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(k_block_size=64),
+        dict(smooth_step_fraction=1.5),
+        dict(perm_refresh_every=0),
+        dict(kmeans_iters=0),
+        dict(kmeans_clusters=0),
+    ],
+)
+def test_vc_config_rejects_invalid_recipes(kwargs):
+    with pytest.raises(ValueError):
+        vca.VCAttentionConfig(**kwargs)
+
+
+def test_vc_flat_scale_layout_roundtrip():
+    from flashinfer.attention.prims_ts.sage import flat_scale_numel, flat_scale_slot
+
+    batch, seq_len, heads, block = 3, 2000, 2, 128
+    nb = (seq_len + block - 1) // block
+    scale = torch.rand(batch, heads, nb) + 0.5
+    flat = vca.flat_block_scales(scale, seq_len, block)
+    assert flat.shape == (heads, flat_scale_numel(batch, seq_len, block))
+    for b in range(batch):
+        for j in range(nb):
+            slot = flat_scale_slot(b, j * block, seq_len, 7)
+            assert torch.equal(flat[:, slot], scale[b, :, j])
+    assert torch.equal(vca.block_scales_from_flat(flat, batch, seq_len, block), scale)
+
+
+@_REQUIRES_SM100
+def test_vc_run_rejects_mismatched_operands():
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    batch, seq_len, heads, head_dim = 1, 512, 2, 128
+    q = torch.randn(batch, seq_len, heads, head_dim, device=device)
+    k = torch.randn_like(q)
+    v = _structured_values(q.shape, device)
+    ops = vca.vc_quantize(q, k, v)
+    common = dict(
+        device=device,
+        batch_size=batch,
+        max_seq_len_q=seq_len,
+        max_kv_len=seq_len,
+        num_qo_heads=heads,
+        num_kv_heads=heads,
+        head_dim=head_dim,
+        q_dtype=torch.float8_e4m3fn,
+        k_dtype=torch.float8_e4m3fn,
+        v_dtype=torch.float8_e4m3fn,
+        out_dtype=torch.bfloat16,
+    )
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(vc_config=vca.VCAttentionConfig(), **common)
+    good = ops.params
+    from dataclasses import replace
+
+    with pytest.raises(ValueError):  # wrong shape
+        wrapper.run(
+            ops.q,
+            ops.k,
+            ops.v,
+            vc=replace(good, k_scale=good.k_scale[:, :-1].contiguous()),
         )
+    with pytest.raises(TypeError):  # wrong dtype
+        wrapper.run(ops.q, ops.k, ops.v, vc=replace(good, q_scale=good.q_scale.half()))
+    with pytest.raises(ValueError):  # non-contiguous
+        wrapper.run(
+            ops.q,
+            ops.k,
+            ops.v,
+            vc=replace(good, tile_means=good.tile_means.transpose(3, 4)),
+        )
+    with pytest.raises(TypeError):
+        wrapper.run(ops.q, ops.k, ops.v, vc={"q_scale": good.q_scale})
+    with pytest.raises(ValueError):  # both spellings at once
+        wrapper.run(ops.q, ops.k, ops.v, vc=good, vc_mu=good.tile_means)
+    with pytest.raises(ValueError):  # operands without a VC plan
+        plain = BatchPrefillTSWrapper()
+        plain.plan(**common)
+        plain.run(ops.q, ops.k, ops.v, vc=good)
+    with pytest.raises(ValueError):  # bf16 inputs together with operands
+        wrapper.run(
+            q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16), vc=good
+        )
+    # The compatibility spelling produces the same output as the params object.
+    out_params = wrapper.run(ops.q, ops.k, ops.v, vc=good)
+    out_compat = wrapper.run(
+        ops.q,
+        ops.k,
+        ops.v,
+        output_scale=ops.v_scale.reshape(-1).contiguous(),
+        vc_mu=ops.mu,
+        vc_q_scale=ops.q_scale,
+        vc_k_scale=ops.k_scale,
+    )
+    assert torch.equal(out_params, out_compat)
 
 
 def test_pack_vc_tile_means_layout():
@@ -260,7 +357,7 @@ def test_vc_wrapper_quantizes_bf16_inputs():
         v_dtype=torch.float8_e4m3fn,
         out_dtype=torch.bfloat16,
         sm_scale=sm_scale,
-        vc_attention=True,
+        vc_config=vca.VCAttentionConfig(),
     )
     out = wrapper.run(q, k, v)
     ops = vca.vc_quantize_fused(
@@ -312,7 +409,7 @@ def test_vc_wrapper_step_schedule():
         v_dtype=torch.float8_e4m3fn,
         out_dtype=torch.bfloat16,
         sm_scale=1.0 / math.sqrt(head_dim),
-        vc_attention=True,
+        vc_config=vca.VCAttentionConfig(),
     )
     exact = torch.nn.functional.scaled_dot_product_attention(
         q.float().transpose(1, 2), k.float().transpose(1, 2), v.float().transpose(1, 2)

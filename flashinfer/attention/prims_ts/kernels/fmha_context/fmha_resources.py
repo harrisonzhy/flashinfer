@@ -495,6 +495,10 @@ class FmhaConfig:
     # Upper bound on K/V tiles per request: sizes the per-group SMEM table of
     # K dequant scales that softmax fills once per work tile.
     vc_max_kv_tiles: int = 0
+    # Exact Q and K/V sequence lengths of the fixed plan: the Q/K dequant scales
+    # use the sage flat layout, slot(b, t) = (b*S >> log2(blk)) + b + (t >> log2(blk)).
+    vc_seq_len_q: int = 0
+    vc_seq_len_k: int = 0
     # Named barrier ids (one per softmax group) ordering that table's refill.
     vc_kscale_barrier_id: int = 8
 
@@ -3371,17 +3375,24 @@ class TmemSPResource(MemoryResource):
         """
         batch_coord, head, row = self._vc_coords(stage_info)
         kv_head = head // self.cfg.h_r
-        q_block = cute.math.min(
-            row >> Int32(self.cfg.vc_q_block_log2),
-            Int32(self.vc_q_scale.shape[2]) - Int32(1),
+        # sfQ in the sage flat layout; rows past the sequence end clamp to the
+        # last valid slot (those rows are masked anyway).
+        lbq = Int32(self.cfg.vc_q_block_log2)
+        row_c = cute.math.min(row, Int32(self.cfg.vc_seq_len_q - 1))
+        q_slot = (
+            ((batch_coord * Int32(self.cfg.vc_seq_len_q)) >> lbq)
+            + batch_coord
+            + (row_c >> lbq)
         )
         row_scale = self.scale_softmax_log2[0] * Float32(
-            self.vc_q_scale[(batch_coord, head, q_block)]
+            self.vc_q_scale[(head, q_slot)]
         )
         num_threads = len(self.cfg.softmax0_warp_ids) * cute.arch.WARP_SIZE
         barrier_id = self.cfg.vc_kscale_barrier_id + self.q_half
         table = self._vc_kscale_table(stage_info)
-        num_tiles = Int32(self.vc_k_scale.shape[2])
+        num_tiles = Int32(self.cfg.vc_max_kv_tiles)
+        lbk = Int32(self.cfg.kv_tile_n.bit_length() - 1)
+        k_base = ((batch_coord * Int32(self.cfg.vc_seq_len_k)) >> lbk) + batch_coord
         warp_id_in_sg = cute.arch.warp_idx() % len(self.cfg.softmax0_warp_ids)
         thread = warp_id_in_sg * cute.arch.WARP_SIZE + cute.arch.lane_idx()
         cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
@@ -3390,9 +3401,7 @@ class TmemSPResource(MemoryResource):
         ):
             tile_idx = Int32(pass_idx * num_threads) + thread
             if tile_idx < num_tiles:
-                table[tile_idx] = Float32(
-                    self.vc_k_scale[(batch_coord, kv_head, tile_idx)]
-                )
+                table[tile_idx] = Float32(self.vc_k_scale[(kv_head, k_base + tile_idx)])
         cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
         return row_scale, Float32(0.0), Float32(table[Int32(0)])
 

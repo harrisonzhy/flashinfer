@@ -3095,7 +3095,7 @@ class FmhaTs:
 
         VC-Attention takes ``vc_mu`` ([B, Hkv, num_kv_tiles, 8, 256] bf16, the
         host-packed tile-mean UMMA operands), ``vc_q_scale``
-        ([B, Hq, ceil(Sq / q_block)] fp32) and ``vc_k_scale``
+        ([Hq, flat_scale_numel(B, Sq, q_block)] fp32, sage flat layout) and ``vc_k_scale``
         ([B, Hkv, num_kv_tiles] fp32).
 
         ``scale_softmax_log2`` and ``output_scale`` must be one-element float32

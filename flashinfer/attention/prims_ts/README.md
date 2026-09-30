@@ -413,6 +413,70 @@ out = wrapper.run(
 its recipe is `sage_config` or, when omitted, the default recipe with a V mean
 exactly when `sage.v_mean` is set.
 
+## VC-Attention
+
+VC-Attention ([Li et al., 2026](https://arxiv.org/html/2609.15810v1)) runs the
+dense fixed-length context kernel (`BatchPrefillTSWrapper`) on E4M3 Q, K and V
+with per-block dequantization scales, value smoothing and a direct
+probability cast. The plan fixes the recipe with
+`vc_config=VCAttentionConfig(...)`; every run supplies the operands as
+`vc=VCAttentionParams(...)`, or passes bf16/fp16 Q/K/V and lets `run()`
+quantize them with the fused CuTe DSL pre-pass:
+
+```text
+K'      = (K - mean_tokens(K)) H,  Q' = Q H          (H: 128-point Hadamard)
+S[r][c] = sfQ[blkQ(r)] * sfK[tileK(c)] * (Q8 . K8^T)[r][c]
+P8      = ExpCast(S - rowmax(S))                     (E4M3 code 8(u+8)+56-0.35)
+O[r][d] = sfV[b, h, d] * (sum_c P8[r][c] * V8[perm(c)][d] + sum_t rowsum_t(P8[r]) * mu_t[d]) / l[r]
+```
+
+`V8` holds the E4M3 residuals of the k-means-permuted values around their
+128-token tile means `mu_t` (stored in bf16, divided by `sfV`); the kernel adds
+the mean term back inside the online softmax recurrence, so the row-max
+correction covers it. Grouping and demeaning run on the first
+`smooth_step_fraction` of the denoising steps (`vc_denoise_step=(i, n)` in
+`run()`), the permutation is refreshed every `perm_refresh_every` steps inside
+that window and kept afterwards.
+
+| Input | Supported values |
+| --- | --- |
+| Q/K/V dtype | `torch.float8_e4m3fn` (all three) |
+| Output dtype | `torch.bfloat16` or `torch.float16` |
+| `q_block_size` | Power of two in [1, 256]; default 128 |
+| `k_block_size` | 128 (the K/V tile whose mean is restored) |
+| `smooth_step_fraction`, `perm_refresh_every` | V-Smooth schedule; defaults 0.25 and 4 |
+| `kmeans_clusters`, `kmeans_iters` | Online k-means grouping; defaults 64 and 3 |
+| Geometry | `head_dim=128`, `num_qo_heads == num_kv_heads`, `packed=False`, `mask_type="dense"` |
+
+### Operand tensors
+
+`q_scale` and `k_scale` use the same flat layout as Sage attention
+(`flat_scale_slot` of `flashinfer.attention.prims_ts.sage`): `q_scale` is
+`[Hq, flat_scale_numel(B, Sq, q_block_size)]` and `k_scale` is
+`[Hkv, flat_scale_numel(B, Skv, 128)]`, both fp32. `v_scale` is the
+`[B, Hkv, D]` fp32 per-channel residual scale and `tile_means` the packed bf16
+`[B, Hkv, ceil(Skv / 128), 8, 256]` mean operand from `pack_vc_tile_means`.
+`vc_quantize` (torch reference) and `vc_quantize_fused` (CuTe DSL) produce all
+of them as `VCAttentionOperands`, whose `.params` is the run-time object.
+
+### Example
+
+```python
+from flashinfer.attention.prims_ts import vc_attention as vca
+from flashinfer.attention.prims_ts.context import BatchPrefillTSWrapper
+
+wrapper = BatchPrefillTSWrapper()
+wrapper.plan(
+    device="cuda", batch_size=1, max_seq_len_q=S, max_kv_len=S,
+    num_qo_heads=H, num_kv_heads=H, head_dim=128,
+    q_dtype=torch.float8_e4m3fn, k_dtype=torch.float8_e4m3fn, v_dtype=torch.float8_e4m3fn,
+    out_dtype=torch.bfloat16, vc_config=vca.VCAttentionConfig(),
+)
+ops = vca.vc_quantize_fused(q_bf16, k_bf16, v_bf16)      # pre-quantized path
+out = wrapper.run(ops.q, ops.k, ops.v, vc=ops.params)
+out = wrapper.run(q_bf16, k_bf16, v_bf16, vc_denoise_step=(step, num_steps))  # quantize inside
+```
+
 ## Validation
 
 Run the numerical, graph, scheduler/resource, and public-surface

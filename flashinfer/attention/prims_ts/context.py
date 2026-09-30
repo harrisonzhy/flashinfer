@@ -46,6 +46,13 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import torch
 
+from .vc_attention import (
+    VCAttentionConfig,
+    VCAttentionParams,
+    validate_vc_params,
+    vc_scale_shapes,
+)
+
 from flashinfer.api_logging import flashinfer_experimental_api
 
 
@@ -161,6 +168,8 @@ class _ContextPlanState:
     # Placeholders bound to the VC-Attention operand slots of non-VC plans.
     empty_vc_mu: torch.Tensor
     empty_vc_scale: torch.Tensor
+    vc_config: Optional[VCAttentionConfig] = None
+    vc_scale_shapes: Optional[dict] = None
 
 
 @dataclass(frozen=True)
@@ -1840,6 +1849,9 @@ def _get_compiled_context(
         fmha.cfg.vc_max_kv_tiles = (
             max_seq_len_k + fmha.cfg.kv_tile_n - 1
         ) // fmha.cfg.kv_tile_n
+        # Flat scale layout addressing needs the exact sequence lengths.
+        fmha.cfg.vc_seq_len_q = max_seq_len_q
+        fmha.cfg.vc_seq_len_k = max_seq_len_k
 
     @cute.jit
     def tensor_adapter(
@@ -1966,8 +1978,6 @@ def _get_compiled_context(
         if packed:
             raise RuntimeError("VC-Attention context requires fixed tensors")
         num_kv_tiles = cute.ceil_div(max_seq_len_k, _CONTEXT_KV_TILE_N)
-        q_block = 1 << vc_q_block_log2
-        num_q_blocks = cute.ceil_div(max_seq_len_q, q_block)
         vc_mu_shape: tuple[object, ...] = (
             batch_size,
             num_kv_heads,
@@ -1975,12 +1985,14 @@ def _get_compiled_context(
             8,
             256,
         )
-        vc_q_scale_shape: tuple[object, ...] = (batch_size, num_qo_heads, num_q_blocks)
-        vc_k_scale_shape: tuple[object, ...] = (batch_size, num_kv_heads, num_kv_tiles)
+        # Q/K scales use the sage flat layout, [heads, ceil(B*S/blk) + B - 1];
+        # the slot count depends on the (symbolic) batch, so it stays dynamic.
+        vc_q_scale_shape: tuple[object, ...] = (num_qo_heads, cute.sym_int())
+        vc_k_scale_shape: tuple[object, ...] = (num_kv_heads, cute.sym_int())
     else:
         vc_mu_shape = (1, 1, 1, 1, 1)
-        vc_q_scale_shape = (1, 1, 1)
-        vc_k_scale_shape = (1, 1, 1)
+        vc_q_scale_shape = (1, 1)
+        vc_k_scale_shape = (1, 1)
     vc_mu_fake = fake_compact(cutlass.BFloat16, vc_mu_shape, 16)
     vc_q_scale_fake = fake_compact(cutlass.Float32, vc_q_scale_shape, 16)
     vc_k_scale_fake = fake_compact(cutlass.Float32, vc_k_scale_shape, 16)
@@ -2523,10 +2535,6 @@ def _prepare_out(
     return out
 
 
-_VC_SMOOTH_STEP_FRACTION = 0.25
-_VC_PERM_REFRESH_EVERY = 4
-
-
 def _validate_vc_output_scale(
     scale: torch.Tensor, *, geometry: _ContextPlanGeometry
 ) -> None:
@@ -2559,55 +2567,35 @@ def _validate_vc_operands(
     vc_k_scale: torch.Tensor,
     *,
     geometry: _ContextPlanGeometry,
+    expected_shapes: Optional[dict] = None,
 ) -> None:
-    """Check the VC-Attention operand tensors against the plan geometry."""
-    num_kv_tiles = (
-        geometry.max_seq_len_k + _CONTEXT_KV_TILE_N - 1
-    ) // _CONTEXT_KV_TILE_N
-    q_block = 1 << geometry.vc_q_block_log2
-    num_q_blocks = (geometry.max_seq_len_q + q_block - 1) // q_block
-    expected = (
-        (
-            vc_mu,
-            "vc_mu",
-            torch.bfloat16,
-            (
-                geometry.batch_size,
-                geometry.num_kv_heads,
-                num_kv_tiles,
-                8,
-                256,
-            ),
-            16,
-        ),
-        (
-            vc_q_scale,
-            "vc_q_scale",
-            torch.float32,
-            (geometry.batch_size, geometry.num_qo_heads, num_q_blocks),
-            16,
-        ),
-        (
-            vc_k_scale,
-            "vc_k_scale",
-            torch.float32,
-            (geometry.batch_size, geometry.num_kv_heads, num_kv_tiles),
-            16,
-        ),
+    """Check the compatibility-spelling VC operands against the plan geometry."""
+    if expected_shapes is None:
+        expected_shapes = vc_scale_shapes(
+            VCAttentionConfig(q_block_size=1 << geometry.vc_q_block_log2),
+            batch_size=geometry.batch_size,
+            seq_len_q=geometry.max_seq_len_q,
+            seq_len_kv=geometry.max_seq_len_k,
+            num_qo_heads=geometry.num_qo_heads,
+            num_kv_heads=geometry.num_kv_heads,
+            head_dim=geometry.head_dim_vo or geometry.head_dim,
+        )
+    shapes = {
+        name: shape for name, shape in expected_shapes.items() if name != "v_scale"
+    }
+    params = VCAttentionParams(
+        q_scale=vc_q_scale, k_scale=vc_k_scale, v_scale=None, tile_means=vc_mu
     )
-    for tensor, name, dtype, shape, alignment in expected:
-        _validate_tensor(tensor, name)
-        if tensor.device != geometry.device:
-            raise ValueError(f"{name} must live on the plan device {geometry.device}")
-        if tensor.dtype != dtype:
-            raise ValueError(f"{name} must be {dtype}; got {tensor.dtype}")
-        if tuple(tensor.shape) != shape:
-            raise ValueError(
-                f"{name} must have shape {shape}; got {tuple(tensor.shape)}"
-            )
-        if not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous")
-        _validate_alignment(tensor, name, alignment)
+    try:
+        validate_vc_params(params, shapes, device=geometry.device)
+    except (TypeError, ValueError) as err:
+        msg = (
+            str(err)
+            .replace("vc.tile_means", "vc_mu")
+            .replace("vc.q_scale", "vc_q_scale")
+            .replace("vc.k_scale", "vc_k_scale")
+        )
+        raise type(err)(msg) from None
 
 
 class BatchPrefillTSWrapper:
@@ -2672,17 +2660,22 @@ class BatchPrefillTSWrapper:
         window_left: int = -1,
         sm_scale: Optional[float] = None,
         output_scale: float = 1.0,
+        vc_config: Optional[VCAttentionConfig] = None,
         vc_attention: bool = False,
         vc_q_block_size: int = 128,
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
 
-        ``vc_attention`` selects the VC-Attention recipe (see
-        :mod:`flashinfer.attention.prims_ts.vc_attention`): E4M3 Q/K with one
-        dequant scale per ``vc_q_block_size`` Q tokens and per 128-token K/V
-        tile, and E4M3 V stored as per-tile residuals whose bf16 tile means
-        the kernel restores. It requires fixed dense tensors, head_dim 128,
-        equal Q and K/V head counts, and E4M3 Q/K/V.
+        ``vc_config`` selects the VC-Attention recipe
+        (:class:`~flashinfer.attention.prims_ts.vc_attention.VCAttentionConfig`):
+        E4M3 Q/K with one dequant scale per ``q_block_size`` Q tokens and per
+        128-token K/V tile, and E4M3 V stored as per-tile residuals whose bf16
+        tile means the kernel restores. Every :meth:`run` then supplies the
+        operands as :class:`VCAttentionParams` (``vc=``), or bf16/fp16 Q/K/V
+        that ``run`` quantizes. It requires fixed dense tensors, head_dim 128,
+        equal Q and K/V head counts, and E4M3 Q/K/V. ``vc_attention`` and
+        ``vc_q_block_size`` are the compatibility spelling of
+        ``vc_config=VCAttentionConfig(q_block_size=...)``.
 
         Packed plans conservatively support any positive per-request Q and K/V
         lengths bounded by ``max_seq_len_q`` and ``max_kv_len``. Fixed plans
@@ -2759,14 +2752,15 @@ class BatchPrefillTSWrapper:
         )
         if not isinstance(vc_attention, bool):
             raise TypeError("vc_attention must be a bool")
-        if vc_attention:
-            if (
-                not isinstance(vc_q_block_size, int)
-                or vc_q_block_size < 1
-                or vc_q_block_size > 256
-                or vc_q_block_size & (vc_q_block_size - 1)
+        if vc_config is not None and not isinstance(vc_config, VCAttentionConfig):
+            raise TypeError("vc_config must be a VCAttentionConfig instance")
+        if vc_config is None and vc_attention:
+            if not isinstance(vc_q_block_size, int) or isinstance(
+                vc_q_block_size, bool
             ):
                 raise ValueError("vc_q_block_size must be a power of two in [1, 256]")
+            vc_config = VCAttentionConfig(q_block_size=vc_q_block_size)
+        if vc_config is not None:
             if geometry.packed or geometry.mask_type != "dense":
                 raise NotImplementedError(
                     "VC-Attention requires fixed dense tensors (packed=False, "
@@ -2787,7 +2781,7 @@ class BatchPrefillTSWrapper:
             geometry = replace(
                 geometry,
                 vc_attention=True,
-                vc_q_block_log2=vc_q_block_size.bit_length() - 1,
+                vc_q_block_log2=vc_config.q_block_log2,
             )
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
@@ -2843,9 +2837,18 @@ class BatchPrefillTSWrapper:
         empty_vc_mu = torch.zeros(
             (1, 1, 1, 1, 1), dtype=torch.bfloat16, device=geometry.device
         )
-        empty_vc_scale = torch.ones(
-            (1, 1, 1), dtype=torch.float32, device=geometry.device
-        )
+        empty_vc_scale = torch.ones((1, 1), dtype=torch.float32, device=geometry.device)
+        vc_shapes = None
+        if vc_config is not None:
+            vc_shapes = vc_scale_shapes(
+                vc_config,
+                batch_size=geometry.batch_size,
+                seq_len_q=geometry.max_seq_len_q,
+                seq_len_kv=geometry.max_seq_len_k,
+                num_qo_heads=geometry.num_qo_heads,
+                num_kv_heads=geometry.num_kv_heads,
+                head_dim=geometry.head_dim_vo or geometry.head_dim,
+            )
         compiled, policy = _get_compiled_context(_context_compile_spec(geometry))
         self._plan_state = _ContextPlanState(
             geometry=geometry,
@@ -2858,6 +2861,8 @@ class BatchPrefillTSWrapper:
             policy=policy,
             empty_vc_mu=empty_vc_mu,
             empty_vc_scale=empty_vc_scale,
+            vc_config=vc_config,
+            vc_scale_shapes=vc_shapes,
         )
 
     @flashinfer_experimental_api
@@ -2869,6 +2874,7 @@ class BatchPrefillTSWrapper:
         v: torch.Tensor,
         *,
         geometry: _ContextPlanGeometry,
+        vc_config: VCAttentionConfig,
         vc_denoise_step: Optional[tuple[int, int]],
     ) -> tuple[torch.Tensor, ...]:
         """bf16/fp16 -> VC operands with the paper's V-Smooth schedule.
@@ -2886,17 +2892,20 @@ class BatchPrefillTSWrapper:
         refresh = entry is None
         if vc_denoise_step is not None:
             step_idx, num_steps = vc_denoise_step
-            smooth = step_idx < math.ceil(_VC_SMOOTH_STEP_FRACTION * num_steps)
+            smooth = step_idx < math.ceil(vc_config.smooth_step_fraction * num_steps)
             refresh = smooth and (
                 entry is None
                 or (
-                    step_idx % _VC_PERM_REFRESH_EVERY == 0 and entry["step"] != step_idx
+                    step_idx % vc_config.perm_refresh_every == 0
+                    and entry["step"] != step_idx
                 )
             )
         if smooth:
             if refresh:
                 perm, centroids = _vca.vc_token_permutation_with_centroids(
                     v,
+                    num_clusters=vc_config.kmeans_clusters,
+                    iters=vc_config.kmeans_iters,
                     init_centroids=None if entry is None else entry["centroids"],
                 )
                 entry = {
@@ -2918,7 +2927,8 @@ class BatchPrefillTSWrapper:
             q,
             k,
             v,
-            q_block_size=1 << geometry.vc_q_block_log2,
+            q_block_size=vc_config.q_block_size,
+            kmeans_iters=vc_config.kmeans_iters,
             perm=perm,
             demean=smooth,
         )
@@ -2942,6 +2952,7 @@ class BatchPrefillTSWrapper:
         out: Optional[torch.Tensor] = None,
         scale_softmax_log2: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
+        vc: Optional[VCAttentionParams] = None,
         vc_mu: Optional[torch.Tensor] = None,
         vc_q_scale: Optional[torch.Tensor] = None,
         vc_k_scale: Optional[torch.Tensor] = None,
@@ -3024,6 +3035,21 @@ class BatchPrefillTSWrapper:
             runtime_kv_indptr = state.empty_i32
 
         vc_output_scale: Optional[torch.Tensor] = None
+        if vc is not None:
+            # Sage-style per-run operands of a VC plan.
+            if not geometry.vc_attention:
+                raise ValueError("vc requires vc_config in plan()")
+            if vc_mu is not None or vc_q_scale is not None or vc_k_scale is not None:
+                raise ValueError(
+                    "pass either vc or the vc_mu/vc_q_scale/vc_k_scale operands"
+                )
+            if q.dtype != torch.float8_e4m3fn:
+                raise ValueError("vc operands go with pre-quantized E4M3 q/k/v")
+            if validate:
+                validate_vc_params(vc, state.vc_scale_shapes, device=geometry.device)
+            vc_mu, vc_q_scale, vc_k_scale = vc.tile_means, vc.q_scale, vc.k_scale
+            group = geometry.num_qo_heads // geometry.num_kv_heads
+            vc_output_scale = vc.v_scale.repeat_interleave(group, dim=1).reshape(-1)
         if geometry.vc_attention and q.dtype != torch.float8_e4m3fn:
             # bf16/fp16 Q/K/V under a VC plan: run the fused VC preprocessing
             # here (token permutation cached per geometry, per-block Q/K scales,
@@ -3035,7 +3061,12 @@ class BatchPrefillTSWrapper:
                 )
             q, k, v, vc_mu, vc_q_scale, vc_k_scale, vc_output_scale = (
                 self._vc_prepare_runtime(
-                    q, k, v, geometry=geometry, vc_denoise_step=vc_denoise_step
+                    q,
+                    k,
+                    v,
+                    geometry=geometry,
+                    vc_config=state.vc_config,
+                    vc_denoise_step=vc_denoise_step,
                 )
             )
         if validate:
@@ -3119,13 +3150,19 @@ class BatchPrefillTSWrapper:
         if geometry.vc_attention:
             if vc_mu is None or vc_q_scale is None or vc_k_scale is None:
                 raise ValueError(
-                    "VC-Attention plans require vc_mu, vc_q_scale, and vc_k_scale"
+                    "VC-Attention plans require vc=VCAttentionParams(...) or bf16 q/k/v"
                 )
-            if validate:
-                _validate_vc_operands(vc_mu, vc_q_scale, vc_k_scale, geometry=geometry)
+            if validate and vc is None:
+                _validate_vc_operands(
+                    vc_mu,
+                    vc_q_scale,
+                    vc_k_scale,
+                    geometry=geometry,
+                    expected_shapes=state.vc_scale_shapes,
+                )
         else:
             if vc_mu is not None or vc_q_scale is not None or vc_k_scale is not None:
-                raise ValueError("vc_* operands require vc_attention=True in plan()")
+                raise ValueError("vc operands require vc_config in plan()")
             vc_mu = state.empty_vc_mu
             vc_q_scale = state.empty_vc_scale
             vc_k_scale = state.empty_vc_scale

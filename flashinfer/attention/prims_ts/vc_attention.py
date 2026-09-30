@@ -37,7 +37,168 @@ import torch
 KV_TILE = 128
 E4M3_MAX = 448.0
 VC_KMEANS_CLUSTERS = 64
+from .sage import flat_scale_numel, flat_scale_slot, log2_block_size
+
 _MEAN_MMA_K = 16
+# The kernel restores one V tile mean per 128-token K/V tile; K scales share it.
+VC_K_BLOCK_SIZE = KV_TILE
+_VC_Q_BLOCK_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+
+
+@dataclass(frozen=True)
+class VCAttentionConfig:
+    """Compile-time VC-Attention recipe of one plan (arXiv 2609.15810).
+
+    ``q_block_size`` tokens share one Q scale (a power of two up to 256);
+    ``k_block_size`` is fixed at 128, the K/V tile whose bf16 value mean the
+    kernel restores. ``smooth_step_fraction`` and ``perm_refresh_every`` are
+    the V-Smooth schedule of :meth:`BatchPrefillTSWrapper.run` with
+    ``vc_denoise_step``: grouping and demeaning run on the first fraction of
+    the denoising steps, the token permutation is recomputed every
+    ``perm_refresh_every`` steps inside that window and kept afterwards.
+    ``kmeans_clusters`` (``None`` = 64) and ``kmeans_iters`` parametrize the
+    online k-means grouping. The defaults are the paper's Wan2.2 settings.
+    """
+
+    q_block_size: int = KV_TILE
+    k_block_size: int = VC_K_BLOCK_SIZE
+    smooth_step_fraction: float = 0.25
+    perm_refresh_every: int = 4
+    kmeans_clusters: int | None = None
+    kmeans_iters: int = 3
+
+    def __post_init__(self) -> None:
+        if self.q_block_size not in _VC_Q_BLOCK_SIZES:
+            raise ValueError(
+                f"q_block_size must be a power of two in [1, 256], got {self.q_block_size}"
+            )
+        if self.k_block_size != VC_K_BLOCK_SIZE:
+            raise ValueError(f"k_block_size must be {VC_K_BLOCK_SIZE}")
+        if not (0.0 <= self.smooth_step_fraction <= 1.0):
+            raise ValueError("smooth_step_fraction must be in [0, 1]")
+        if self.perm_refresh_every < 1:
+            raise ValueError("perm_refresh_every must be at least 1")
+        if self.kmeans_clusters is not None and self.kmeans_clusters < 1:
+            raise ValueError("kmeans_clusters must be at least 1")
+        if self.kmeans_iters < 1:
+            raise ValueError("kmeans_iters must be at least 1")
+
+    @property
+    def q_block_log2(self) -> int:
+        return log2_block_size(self.q_block_size)
+
+
+@dataclass(frozen=True)
+class VCAttentionParams:
+    """Per-run VC-Attention operands beyond the E4M3 ``q``, ``k``, ``v``.
+
+    ``q_scale`` is ``[Hq, flat_scale_numel(B, Sq, q_block_size)]`` and
+    ``k_scale`` ``[Hkv, flat_scale_numel(B, Skv, 128)]`` fp32 in the flat
+    scale layout of :mod:`flashinfer.attention.prims_ts.sage`; ``v_scale`` is
+    the ``[B, Hkv, D]`` fp32 per-channel E4M3 residual scale; ``tile_means``
+    is the packed bf16 mean operand ``[B, Hkv, num_kv_tiles, 8, 256]`` from
+    :func:`pack_vc_tile_means` (means already divided by ``v_scale``). Scales
+    must be positive and finite; the kernel does not check them.
+    """
+
+    q_scale: torch.Tensor
+    k_scale: torch.Tensor
+    v_scale: torch.Tensor
+    tile_means: torch.Tensor
+
+
+def vc_scale_shapes(
+    config: VCAttentionConfig,
+    *,
+    batch_size: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> dict[str, tuple[int, ...]]:
+    """Return the shape of every :class:`VCAttentionParams` tensor, by field."""
+    num_kv_tiles = _blocks(seq_len_kv, KV_TILE)
+    return {
+        "q_scale": (
+            num_qo_heads,
+            flat_scale_numel(batch_size, seq_len_q, config.q_block_size),
+        ),
+        "k_scale": (
+            num_kv_heads,
+            flat_scale_numel(batch_size, seq_len_kv, config.k_block_size),
+        ),
+        "v_scale": (batch_size, num_kv_heads, head_dim),
+        "tile_means": (batch_size, num_kv_heads, num_kv_tiles, 8, 256),
+    }
+
+
+_VC_PARAM_DTYPES = {
+    "q_scale": torch.float32,
+    "k_scale": torch.float32,
+    "v_scale": torch.float32,
+    "tile_means": torch.bfloat16,
+}
+
+
+def validate_vc_params(
+    params: VCAttentionParams,
+    expected_shapes: dict[str, tuple[int, ...]],
+    *,
+    device: torch.device,
+) -> None:
+    """Validate the operands of one run against the plan's expected shapes."""
+    if not isinstance(params, VCAttentionParams):
+        raise TypeError("vc must be a VCAttentionParams instance")
+    for name, shape in expected_shapes.items():
+        tensor = getattr(params, name)
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"vc.{name} must be a torch.Tensor")
+        if tensor.device != device:
+            raise ValueError(f"vc.{name} must be on {device}, got {tensor.device}")
+        if tensor.dtype != _VC_PARAM_DTYPES[name]:
+            raise TypeError(
+                f"vc.{name} must have dtype {_VC_PARAM_DTYPES[name]}, got {tensor.dtype}"
+            )
+        if tuple(tensor.shape) != tuple(shape):
+            raise ValueError(
+                f"vc.{name} must have shape {tuple(shape)}, got {tuple(tensor.shape)}"
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(f"vc.{name} must be contiguous")
+        if tensor.data_ptr() % 16 != 0:
+            raise ValueError(f"vc.{name} must be 16-byte aligned")
+
+
+def flat_block_scales(
+    scale: torch.Tensor, seq_len: int, block_size: int
+) -> torch.Tensor:
+    """Pack ``[B, H, ceil(S / blk)]`` block scales into the flat ``[H, numel]`` layout."""
+    b, h, nb = scale.shape
+    out = torch.ones(
+        (h, flat_scale_numel(b, seq_len, block_size)),
+        dtype=torch.float32,
+        device=scale.device,
+    )
+    lb = log2_block_size(block_size)
+    for bi in range(b):
+        base = int(flat_scale_slot(bi, 0, seq_len, lb))
+        out[:, base : base + nb] = scale[bi]
+    return out
+
+
+def block_scales_from_flat(
+    flat: torch.Tensor, batch_size: int, seq_len: int, block_size: int
+) -> torch.Tensor:
+    """Inverse of :func:`flat_block_scales`: ``[H, numel]`` -> ``[B, H, ceil(S / blk)]``."""
+    nb = _blocks(seq_len, block_size)
+    lb = log2_block_size(block_size)
+    return torch.stack(
+        [
+            flat[:, int(flat_scale_slot(bi, 0, seq_len, lb)) :][:, :nb]
+            for bi in range(batch_size)
+        ]
+    )
 
 
 @dataclass(frozen=True)
@@ -51,8 +212,10 @@ class VCAttentionOperands:
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor
-    q_scale: torch.Tensor  # [B, H, ceil(S_q / q_block)] fp32
-    k_scale: torch.Tensor  # [B, H, num_kv_tiles] fp32
+    q_scale: (
+        torch.Tensor
+    )  # [H, flat_scale_numel(B, S_q, q_block)] fp32 (sage flat layout)
+    k_scale: torch.Tensor  # [H, flat_scale_numel(B, S_k, 128)] fp32 (sage flat layout)
     v_scale: (
         torch.Tensor
     )  # [B, H, D] fp32 per-channel E4M3 residual scale (feeds output_scale)
@@ -60,6 +223,16 @@ class VCAttentionOperands:
     mu: torch.Tensor  # [B, H, num_kv_tiles, 8, 256] bf16 packed kernel operand
     perm: torch.Tensor  # [B, H, S_k] int64 token permutation
     q_block_size: int
+
+    @property
+    def params(self) -> "VCAttentionParams":
+        """The per-run operands :meth:`BatchPrefillTSWrapper.run` takes as ``vc``."""
+        return VCAttentionParams(
+            q_scale=self.q_scale,
+            k_scale=self.k_scale,
+            v_scale=self.v_scale,
+            tile_means=self.mu,
+        )
 
 
 def _blocks(length: int, block: int) -> int:
@@ -100,12 +273,15 @@ def _block_amax_scale(x: torch.Tensor, block: int) -> torch.Tensor:
     )  # [B, H, nb]
 
 
+def _per_token_scales(scale: torch.Tensor, s: int, block: int) -> torch.Tensor:
+    """Expand ``[B, H, nb]`` block scales to ``[B, S, H]``."""
+    return scale.permute(0, 2, 1).repeat_interleave(block, dim=1)[:, :s]
+
+
 def _quantize_blocks(x: torch.Tensor, scale: torch.Tensor, block: int) -> torch.Tensor:
     """Divide ``[B, S, H, D]`` by its ``[B, H, nb]`` block scale and round to E4M3."""
     b, s, h, d = x.shape
-    per_token = scale.permute(0, 2, 1).repeat_interleave(block, dim=1)[
-        :, :s
-    ]  # [B, S, H]
+    per_token = _per_token_scales(scale, s, block)  # [B, S, H]
     return (x.float() / per_token.unsqueeze(-1)).to(torch.float8_e4m3fn)
 
 
@@ -314,8 +490,8 @@ def vc_quantize(
         q=q8.contiguous(),
         k=k8.contiguous(),
         v=v8.contiguous(),
-        q_scale=q_scale,
-        k_scale=k_scale,
+        q_scale=flat_block_scales(q_scale, q.shape[1], q_block_size),
+        k_scale=flat_block_scales(k_scale, s_k, KV_TILE),
         v_scale=v_scale,
         mean=mean,
         mu=pack_vc_tile_means(mean, v_scale),
@@ -406,12 +582,10 @@ def vc_reference(
     s_k = ops.k.shape[1]
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(d)
-    q = ops.q.float() * ops.q_scale.permute(0, 2, 1).repeat_interleave(
-        ops.q_block_size, dim=1
-    )[:, :s_q].unsqueeze(-1)
-    k = ops.k.float() * ops.k_scale.permute(0, 2, 1).repeat_interleave(KV_TILE, dim=1)[
-        :, :s_k
-    ].unsqueeze(-1)
+    q_scale = block_scales_from_flat(ops.q_scale, b, s_q, ops.q_block_size)
+    k_scale = block_scales_from_flat(ops.k_scale, b, s_k, KV_TILE)
+    q = ops.q.float() * _per_token_scales(q_scale, s_q, ops.q_block_size).unsqueeze(-1)
+    k = ops.k.float() * _per_token_scales(k_scale, s_k, KV_TILE).unsqueeze(-1)
     # The kernel restores bf16(mean / v_scale) * v_scale, per channel.
     vs = ops.v_scale.reshape(b, ops.k.shape[2], 1, d)  # [B, H, 1, D]
     mean = (ops.mean / vs).to(torch.bfloat16).float() * vs
@@ -424,7 +598,14 @@ def vc_reference(
 
 __all__ = [
     "KV_TILE",
+    "VC_K_BLOCK_SIZE",
+    "VCAttentionConfig",
     "VCAttentionOperands",
+    "VCAttentionParams",
+    "block_scales_from_flat",
+    "flat_block_scales",
+    "validate_vc_params",
+    "vc_scale_shapes",
     "hadamard_matrix",
     "vc_token_permutation_with_centroids",
     "pack_vc_tile_means",
