@@ -214,6 +214,51 @@ def test_vc_config_rejects_invalid_recipes(kwargs):
         vca.VCAttentionConfig(**kwargs)
 
 
+@_REQUIRES_SM100
+def test_vc_demean_off_skips_the_mean_step_exactly():
+    """With zero tile means, demean=False (mean UMMA skipped) equals demean=True bit for bit,
+    and differs from a run whose means are non-zero."""
+    from dataclasses import replace
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    batch, seq_len, heads, head_dim = 1, 1024, 2, 128
+    q = torch.randn(batch, seq_len, heads, head_dim, device=device)
+    k = torch.randn_like(q)
+    v = _structured_values(q.shape, device)
+    perm = vca.vc_token_permutation(v)
+    plain = vca.vc_quantize(q, k, v, perm=perm, demean=False)
+    smooth = vca.vc_quantize(q, k, v, perm=perm, demean=True)
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device=device,
+        batch_size=batch,
+        max_seq_len_q=seq_len,
+        max_kv_len=seq_len,
+        num_qo_heads=heads,
+        num_kv_heads=heads,
+        head_dim=head_dim,
+        q_dtype=torch.float8_e4m3fn,
+        k_dtype=torch.float8_e4m3fn,
+        v_dtype=torch.float8_e4m3fn,
+        out_dtype=torch.bfloat16,
+        vc_config=vca.VCAttentionConfig(),
+    )
+    out_on = wrapper.run(plain.q, plain.k, plain.v, vc=plain.params)
+    out_off = wrapper.run(
+        plain.q, plain.k, plain.v, vc=replace(plain.params, demean=False)
+    )
+    assert torch.equal(out_on, out_off)
+    out_smooth = wrapper.run(smooth.q, smooth.k, smooth.v, vc=smooth.params)
+    out_smooth_off = wrapper.run(
+        smooth.q, smooth.k, smooth.v, vc=replace(smooth.params, demean=False)
+    )
+    assert not torch.equal(out_smooth, out_smooth_off)
+    ref = vca.vc_reference(smooth)
+    rel = ((out_smooth.float() - ref).norm() / ref.norm()).item()
+    assert rel < 6e-2, rel
+
+
 def test_vc_flat_scale_layout_roundtrip():
     from flashinfer.attention.prims_ts.sage import flat_scale_numel, flat_scale_slot
 
@@ -274,6 +319,8 @@ def test_vc_run_rejects_mismatched_operands():
         )
     with pytest.raises(TypeError):
         wrapper.run(ops.q, ops.k, ops.v, vc={"q_scale": good.q_scale})
+    with pytest.raises(TypeError):
+        wrapper.run(ops.q, ops.k, ops.v, vc=replace(good, demean=1))
     with pytest.raises(ValueError):  # both spellings at once
         wrapper.run(ops.q, ops.k, ops.v, vc=good, vc_mu=good.tile_means)
     with pytest.raises(ValueError):  # operands without a VC plan

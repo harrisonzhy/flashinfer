@@ -97,14 +97,19 @@ class VCAttentionParams:
     scale layout of :mod:`flashinfer.attention.prims_ts.sage`; ``v_scale`` is
     the ``[B, Hkv, D]`` fp32 per-channel E4M3 residual scale; ``tile_means``
     is the packed bf16 mean operand ``[B, Hkv, num_kv_tiles, 8, 256]`` from
-    :func:`pack_vc_tile_means` (means already divided by ``v_scale``). Scales
-    must be positive and finite; the kernel does not check them.
+    :func:`pack_vc_tile_means` (means already divided by ``v_scale``); ``demean``
+    says whether the run restores them (``False`` after the V-Smooth window,
+    when they are zero). Scales must be positive and finite; the kernel does
+    not check them.
     """
 
     q_scale: torch.Tensor
     k_scale: torch.Tensor
     v_scale: torch.Tensor
     tile_means: torch.Tensor
+    # False after the V-Smooth window: the tile means are zero and the kernel
+    # runs the plain low-bit recipe without the mean-restore steps.
+    demean: bool = True
 
 
 def vc_scale_shapes(
@@ -150,6 +155,8 @@ def validate_vc_params(
     """Validate the operands of one run against the plan's expected shapes."""
     if not isinstance(params, VCAttentionParams):
         raise TypeError("vc must be a VCAttentionParams instance")
+    if not isinstance(params.demean, bool):
+        raise TypeError("vc.demean must be a bool")
     for name, shape in expected_shapes.items():
         tensor = getattr(params, name)
         if not isinstance(tensor, torch.Tensor):

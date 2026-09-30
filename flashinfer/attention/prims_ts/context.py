@@ -170,6 +170,8 @@ class _ContextPlanState:
     empty_vc_scale: torch.Tensor
     vc_config: Optional[VCAttentionConfig] = None
     vc_scale_shapes: Optional[dict] = None
+    vc_ctrl_on: Optional[torch.Tensor] = None
+    vc_ctrl_off: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -1869,6 +1871,7 @@ def _get_compiled_context(
         vc_mu: cute.Tensor,
         vc_q_scale: cute.Tensor,
         vc_k_scale: cute.Tensor,
+        vc_ctrl: cute.Tensor,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed: cutlass.Constexpr[bool],
@@ -1897,6 +1900,7 @@ def _get_compiled_context(
                 vc_mu=vc_mu,
                 vc_q_scale=vc_q_scale,
                 vc_k_scale=vc_k_scale,
+                vc_ctrl=vc_ctrl,
             )
         else:
             fmha(
@@ -1914,6 +1918,7 @@ def _get_compiled_context(
                 vc_mu=vc_mu,
                 vc_q_scale=vc_q_scale,
                 vc_k_scale=vc_k_scale,
+                vc_ctrl=vc_ctrl,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -1996,6 +2001,7 @@ def _get_compiled_context(
     vc_mu_fake = fake_compact(cutlass.BFloat16, vc_mu_shape, 16)
     vc_q_scale_fake = fake_compact(cutlass.Float32, vc_q_scale_shape, 16)
     vc_k_scale_fake = fake_compact(cutlass.Float32, vc_k_scale_shape, 16)
+    vc_ctrl_fake = fake_compact(cutlass.Int32, (1,), 4)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so
@@ -2017,6 +2023,7 @@ def _get_compiled_context(
             vc_mu_fake,
             vc_q_scale_fake,
             vc_k_scale_fake,
+            vc_ctrl_fake,
             stream_fake,
             max_active_clusters,
             packed,
@@ -2863,6 +2870,8 @@ class BatchPrefillTSWrapper:
             empty_vc_scale=empty_vc_scale,
             vc_config=vc_config,
             vc_scale_shapes=vc_shapes,
+            vc_ctrl_on=torch.ones((1,), dtype=torch.int32, device=geometry.device),
+            vc_ctrl_off=torch.zeros((1,), dtype=torch.int32, device=geometry.device),
         )
 
     @flashinfer_experimental_api
@@ -2936,7 +2945,7 @@ class BatchPrefillTSWrapper:
         vc_mu, vc_q_scale, vc_k_scale = ops.mu, ops.q_scale, ops.k_scale
         group = geometry.num_qo_heads // geometry.num_kv_heads
         vc_output_scale = ops.v_scale.repeat_interleave(group, dim=1).reshape(-1)
-        return q, k, v, vc_mu, vc_q_scale, vc_k_scale, vc_output_scale
+        return q, k, v, vc_mu, vc_q_scale, vc_k_scale, vc_output_scale, smooth
 
     def run(
         self,
@@ -3035,6 +3044,7 @@ class BatchPrefillTSWrapper:
             runtime_kv_indptr = state.empty_i32
 
         vc_output_scale: Optional[torch.Tensor] = None
+        vc_ctrl = state.vc_ctrl_on if state.vc_ctrl_on is not None else state.empty_i32
         if vc is not None:
             # Sage-style per-run operands of a VC plan.
             if not geometry.vc_attention:
@@ -3050,6 +3060,7 @@ class BatchPrefillTSWrapper:
             vc_mu, vc_q_scale, vc_k_scale = vc.tile_means, vc.q_scale, vc.k_scale
             group = geometry.num_qo_heads // geometry.num_kv_heads
             vc_output_scale = vc.v_scale.repeat_interleave(group, dim=1).reshape(-1)
+            vc_ctrl = state.vc_ctrl_on if vc.demean else state.vc_ctrl_off
         if geometry.vc_attention and q.dtype != torch.float8_e4m3fn:
             # bf16/fp16 Q/K/V under a VC plan: run the fused VC preprocessing
             # here (token permutation cached per geometry, per-block Q/K scales,
@@ -3059,7 +3070,7 @@ class BatchPrefillTSWrapper:
                     "pass either pre-quantized E4M3 q/k/v with vc_* operands, or "
                     "bf16/fp16 q/k/v and let run() quantize them"
                 )
-            q, k, v, vc_mu, vc_q_scale, vc_k_scale, vc_output_scale = (
+            q, k, v, vc_mu, vc_q_scale, vc_k_scale, vc_output_scale, smooth = (
                 self._vc_prepare_runtime(
                     q,
                     k,
@@ -3069,6 +3080,7 @@ class BatchPrefillTSWrapper:
                     vc_denoise_step=vc_denoise_step,
                 )
             )
+            vc_ctrl = state.vc_ctrl_on if smooth else state.vc_ctrl_off
         if validate:
             _validate_runtime_inputs(
                 q,
@@ -3195,6 +3207,7 @@ class BatchPrefillTSWrapper:
             vc_mu,
             vc_q_scale,
             vc_k_scale,
+            vc_ctrl,
         )
         return out
 

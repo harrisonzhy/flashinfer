@@ -681,6 +681,7 @@ def build_context_task_manager(
     tma_mu_desc: cutlass.Pointer | None = None,
     vc_q_scale: cute.Tensor | None = None,
     vc_k_scale: cute.Tensor | None = None,
+    vc_ctrl: cute.Tensor | None = None,
     num_kv_tiles: int | Int32,
     q_offset: int | Int32,
     domain_n_kwargs: DomainKwargs,
@@ -1345,6 +1346,7 @@ def build_context_task_manager(
         tmem_vec1_resource=tmem_vec1,
         smem_p0_resource=smem_p0,
         smem_p1_resource=smem_p1,
+        vc_ctrl=vc_ctrl,
         name="tmem_o",
         **tmem_o_kwargs,
     )
@@ -2583,6 +2585,7 @@ def build_fmha_task_manager(
     tma_mu_desc: cutlass.Pointer | None = None,
     vc_q_scale: cute.Tensor | None = None,
     vc_k_scale: cute.Tensor | None = None,
+    vc_ctrl: cute.Tensor | None = None,
     is_persistent: bool = True,
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
@@ -2677,6 +2680,7 @@ def build_fmha_task_manager(
         tma_mu_desc=tma_mu_desc,
         vc_q_scale=vc_q_scale,
         vc_k_scale=vc_k_scale,
+        vc_ctrl=vc_ctrl,
         num_kv_tiles=domain_num_kv_tiles,
         q_offset=effective_q_offset,
         domain_n_kwargs=domain_policy.domain_n_kwargs,
@@ -3090,12 +3094,15 @@ class FmhaTs:
         vc_mu: cute.Tensor | None = None,
         vc_q_scale: cute.Tensor | None = None,
         vc_k_scale: cute.Tensor | None = None,
+        vc_ctrl: cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
         VC-Attention takes ``vc_mu`` ([B, Hkv, num_kv_tiles, 8, 256] bf16, the
         host-packed tile-mean UMMA operands), ``vc_q_scale``
-        ([Hq, flat_scale_numel(B, Sq, q_block)] fp32, sage flat layout) and ``vc_k_scale``
+        ([Hq, flat_scale_numel(B, Sq, q_block)] fp32, sage flat layout), ``vc_k_scale``, and
+        ``vc_ctrl`` (one Int32: 1 = restore the tile means, 0 = plain low-bit kernel after the
+        V-Smooth window)
         ([B, Hkv, num_kv_tiles] fp32).
 
         ``scale_softmax_log2`` and ``output_scale`` must be one-element float32
@@ -3428,6 +3435,7 @@ class FmhaTs:
             tma_mu_desc,
             vc_q_scale,
             vc_k_scale,
+            vc_ctrl,
             self.is_persistent,
             self.is_clc_dynamic,
         ).launch(
@@ -3471,6 +3479,7 @@ class FmhaTs:
         tma_mu_desc: cutlass.GridConstant[cuda.TensorMap],
         vc_q_scale: cute.Tensor | None,
         vc_k_scale: cute.Tensor | None,
+        vc_ctrl: cute.Tensor | None,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
     ) -> None:
@@ -3540,6 +3549,7 @@ class FmhaTs:
             tma_mu_desc=tma_mu_desc.get_ptr() if cfg.vc_attention else None,
             vc_q_scale=vc_q_scale if cfg.vc_attention else None,
             vc_k_scale=vc_k_scale if cfg.vc_attention else None,
+            vc_ctrl=vc_ctrl if cfg.vc_attention else None,
             is_persistent=is_persistent,
             is_clc_dynamic=is_clc_dynamic,
             clc_response_ptr=clc_response_ptr,

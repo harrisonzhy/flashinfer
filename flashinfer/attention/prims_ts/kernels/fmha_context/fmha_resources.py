@@ -5620,11 +5620,18 @@ class TmemOResource(MemoryResource):
         tmem_vec1_resource: TmemStatsResource | None = None,
         smem_p0_resource: Optional[SmemPResource] = None,
         smem_p1_resource: Optional[SmemPResource] = None,
+        vc_ctrl: cute.Tensor | None = None,
         **kwargs: Any,
     ) -> None:
-        """Bind O TMEM offsets, correction-stat resources, and SMEM P tiles."""
+        """Bind O TMEM offsets, correction-stat resources, and SMEM P tiles.
+
+        ``vc_ctrl`` is the VC-Attention run control word: element 0 is 1 when
+        the tile means are restored and 0 when the run is the plain low-bit
+        kernel (V-Smooth off), which skips the mean UMMA steps.
+        """
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
+        self.vc_ctrl = vc_ctrl
         self.smem_p0_resource = smem_p0_resource
         self.smem_p1_resource = smem_p1_resource
         self.tmem_o0_offset = tmem_o0_offset
@@ -5755,7 +5762,7 @@ class TmemOResource(MemoryResource):
             tmem_ptr_o,
             desc_mu_base,
             prims.CTAGroup.CTA_1,
-            cutlass.Boolean(True),
+            self._vc_restore_means(),
         )
 
     @producer_work
@@ -5781,7 +5788,7 @@ class TmemOResource(MemoryResource):
             tmem_ptr_o,
             desc_mu_last,
             prims.CTAGroup.CTA_1,
-            cutlass.Boolean(True),
+            self._vc_restore_means(),
         )
 
     @cute.jit
@@ -6048,6 +6055,13 @@ class TmemOResource(MemoryResource):
                                     scale_d_stage,
                                 )
                         scale_d_stage = True
+
+    @cute.jit
+    def _vc_restore_means(self) -> cutlass.Boolean:
+        """Whether this run restores the V tile means (``vc_ctrl[0] != 0``)."""
+        if cutlass.const_expr(self.vc_ctrl is None):
+            return cutlass.Boolean(True)
+        return self.vc_ctrl[0] != Int32(0)
 
     @cute.jit
     def _vc_mean_mma(
