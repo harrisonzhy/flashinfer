@@ -259,6 +259,47 @@ def test_vc_demean_off_skips_the_mean_step_exactly():
     assert rel < 6e-2, rel
 
 
+@_REQUIRES_SM100
+def test_vc_two_cta_matches_single_cta(monkeypatch):
+    """The two-CTA UMMA form (default on SM103) reproduces the single-CTA kernel:
+    odd Q-tile count (cluster padding), partial last K/V tile, two batches."""
+    from flashinfer.attention.prims_ts import context as context_module
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    batch, seq_len, heads, head_dim = 2, 2120, 2, 128
+    q = torch.randn(batch, seq_len, heads, head_dim, device=device)
+    k = torch.randn_like(q)
+    v = _structured_values(q.shape, device)
+    ops = vca.vc_quantize(q, k, v)
+    outs = []
+    for two_cta in (True, False):
+        monkeypatch.setattr(
+            context_module, "_default_two_cta_umma", lambda device_index, _t=two_cta: _t
+        )
+        wrapper = BatchPrefillTSWrapper()
+        wrapper.plan(
+            device=device,
+            batch_size=batch,
+            max_seq_len_q=seq_len,
+            max_kv_len=seq_len,
+            num_qo_heads=heads,
+            num_kv_heads=heads,
+            head_dim=head_dim,
+            q_dtype=torch.float8_e4m3fn,
+            k_dtype=torch.float8_e4m3fn,
+            v_dtype=torch.float8_e4m3fn,
+            out_dtype=torch.bfloat16,
+            vc_config=vca.VCAttentionConfig(),
+        )
+        outs.append(wrapper.run(ops.q, ops.k, ops.v, vc=ops.params).float())
+    ref = vca.vc_reference(ops)
+    for out in outs:
+        rel = ((out - ref).norm() / ref.norm()).item()
+        assert rel < 6e-2, rel
+    torch.testing.assert_close(outs[0], outs[1], atol=2e-3, rtol=1e-2)
+
+
 def test_vc_flat_scale_layout_roundtrip():
     from flashinfer.attention.prims_ts.sage import flat_scale_numel, flat_scale_slot
 

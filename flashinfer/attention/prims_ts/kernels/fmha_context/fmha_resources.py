@@ -2713,12 +2713,33 @@ class SmemMuResource(MemoryResource):
             sMu_curr = self.sMu_array.subview(
                 stage_info.stage_idx * self.stage_elements
             )
-            prims.cp_async_bulk_tensor_shared_cta_global(
-                sMu_curr,
-                self.tma_mu_desc,
-                (Int32(0), Int32(0), tile_idx, kv_head_coord, batch_coord),
-                stage_info.barrier,
-            )
+            if cutlass.const_expr(self.cfg.two_cta_umma):
+                # This CTA stages the 64 channels (4 of the 8 packed rows) its
+                # half of the M=256 mean step reads; the byte count arrives at
+                # the leader's barrier as a cta_group::2 copy, like K/V.
+                cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+                prims.cp_async_bulk_tensor_shared_cluster_global(
+                    sMu_curr,
+                    self.tma_mu_desc,
+                    (
+                        Int32(0),
+                        cta_rank * Int32(4),
+                        tile_idx,
+                        kv_head_coord,
+                        batch_coord,
+                    ),
+                    cutlass.Array(stage_info.barrier.data_ptr(), dtype=cutlass.Int64),
+                    [],
+                    multicast_mask=Int16(Int32(1) << cta_rank),
+                    group=prims.CTAGroup.CTA_2,
+                )
+            else:
+                prims.cp_async_bulk_tensor_shared_cta_global(
+                    sMu_curr,
+                    self.tma_mu_desc,
+                    (Int32(0), Int32(0), tile_idx, kv_head_coord, batch_coord),
+                    stage_info.barrier,
+                )
 
     @producer_work
     @cute.jit
@@ -5732,8 +5753,8 @@ class TmemOResource(MemoryResource):
             smem_p,
             tmem_ptr_o,
             desc_mu_base,
-            prims.CTAGroup.CTA_1,
-            self._vc_restore_means(),
+            self._vc_mean_cta_group(),
+            self._vc_mean_issue(),
         )
 
     @producer_work
@@ -5758,8 +5779,8 @@ class TmemOResource(MemoryResource):
             smem_p,
             tmem_ptr_o,
             desc_mu_last,
-            prims.CTAGroup.CTA_1,
-            self._vc_restore_means(),
+            self._vc_mean_cta_group(),
+            self._vc_mean_issue(),
         )
 
     @cute.jit
@@ -6026,6 +6047,23 @@ class TmemOResource(MemoryResource):
                                     scale_d_stage,
                                 )
                         scale_d_stage = True
+
+    def _vc_mean_cta_group(self):
+        """cta_group::2 under two-CTA UMMA (M=256 over both CTAs' row sums)."""
+        if self.cfg.two_cta_umma:
+            return prims.CTAGroup.CTA_2
+        return prims.CTAGroup.CTA_1
+
+    @cute.jit
+    def _vc_mean_issue(self) -> cutlass.Boolean:
+        """Issue predicate of the mean step: the run restores means and, under
+        two-CTA UMMA, this CTA is the cluster leader."""
+        issue = self._vc_restore_means()
+        if cutlass.const_expr(self.cfg.two_cta_umma):
+            issue = issue & (
+                cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == 0
+            )
+        return issue
 
     @cute.jit
     def _vc_restore_means(self) -> cutlass.Boolean:

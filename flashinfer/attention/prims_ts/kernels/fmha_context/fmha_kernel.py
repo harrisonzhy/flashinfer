@@ -1078,12 +1078,16 @@ def build_context_task_manager(
     if cfg.vc_attention:
         smem_mu_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
             num_stages=cfg.vc_mean_stages,
-            num_bytes=cfg.vc_mean_tile_bytes * cfg.cta_group_size,
+            # Under two-CTA UMMA each CTA stages the N/2 channels of the mean
+            # operand its half of the M=256 step reads (like V columns).
+            num_bytes=cfg.vc_mean_tile_bytes,
             producer_group=tma_producer_group,
             consumer_group=pipeline.CooperativeGroup(Agent.Thread),
             cta_layout_vmnk=cluster_shape_vmnk,
             advance_on_wait=True,
-            num_bytes_per_warp_per_cta=cfg.vc_mean_tile_bytes if two_cta else None,
+            num_bytes_per_warp_per_cta=cfg.vc_mean_tile_bytes // cfg.cta_group_size
+            if two_cta
+            else None,
             **tma_umma_leader_kwargs,
         )
         smem_mu = SmemMuResource(
@@ -2884,7 +2888,6 @@ class FmhaTs:
             or has_variable_window
             or head_paired
             or use_paged_kv
-            or two_cta_umma
             or h_r != 1
             or d != 128
             or d_v != 128
@@ -2893,7 +2896,7 @@ class FmhaTs:
         ):
             raise ValueError(
                 "VC-Attention requires the dense contiguous query-paired D128 "
-                "context kernel with 8-bit Q/K/V on one CTA"
+                "context kernel with 8-bit Q/K/V"
             )
         if vc_attention and not (0 <= vc_q_block_log2 <= 8):
             raise ValueError("vc_q_block_log2 must be in [0, 8]")
@@ -3318,7 +3321,8 @@ class FmhaTs:
                 )
             tma_mu_desc = cuda.create_tensor_map_tiled_from_view(
                 vc_mu,
-                box_dims=(1, 1, 1, 8, 256),
+                # 8 rows of 256 bf16 per tile; two-CTA loads 4 rows (64 channels) per CTA.
+                box_dims=(1, 1, 1, 8 // cfg.cta_group_size, 256),
                 stride_order=(4, 3, 2, 1, 0),
                 swizzle=cuda.TensorMapSwizzle.none,
                 l2_promotion=cuda.TensorMapL2Promotion.none,
