@@ -87,6 +87,7 @@ from cutlass.pipeline import PipelineAsync, PipelineState
 from cutlass.cutlass_dsl import Boolean, Constexpr, dsl_user_op, if_generate
 
 from ..placeholder_helpers import _placeholder_smem_array, _placeholder_tmem_ptr
+from .vc_scales import VCKScaleTable, vc_flat_k_base, vc_flat_q_slot
 from .helpers import (
     bottom_right_window_left_bound,
     bottom_right_window_tile_start,
@@ -3344,19 +3345,10 @@ class TmemSPResource(MemoryResource):
         head = head_coord * self.cfg.work_tile_q_heads
         return batch_coord, head, row
 
-    @cute.jit
-    def _vc_kscale_table(self, stage_info: StageInfo) -> cutlass.Array:
-        """This softmax group's SMEM table of ``sfK`` per K/V tile."""
-        assert self.smem_p is not None
-        context = stage_info.context
-        return cutlass.Array(
-            context.smem_base.data_ptr()
-            + self.smem_p._alloc.offset
-            + self.smem_p.kscale_table_offset,
-            dtype=Float32,
-            shape=(self.cfg.vc_kscale_table_bytes // 4,),
-            addrspace=3,
-        )
+    @property
+    def _vc_k_scales(self) -> VCKScaleTable:
+        """This softmax group's staged ``sfK`` table (see ``vc_scales``)."""
+        return VCKScaleTable(self.cfg, self.smem_p, self.q_half)
 
     @consumer_work(
         work_attrs=WorkAttr.AUXILIARY,
@@ -3375,35 +3367,17 @@ class TmemSPResource(MemoryResource):
         """
         batch_coord, head, row = self._vc_coords(stage_info)
         kv_head = head // self.cfg.h_r
-        # sfQ in the sage flat layout; rows past the sequence end clamp to the
-        # last valid slot (those rows are masked anyway).
-        lbq = Int32(self.cfg.vc_q_block_log2)
-        row_c = cute.math.min(row, Int32(self.cfg.vc_seq_len_q - 1))
-        q_slot = (
-            ((batch_coord * Int32(self.cfg.vc_seq_len_q)) >> lbq)
-            + batch_coord
-            + (row_c >> lbq)
+        q_slot = vc_flat_q_slot(
+            batch_coord, row, self.cfg.vc_seq_len_q, self.cfg.vc_q_block_log2
         )
         row_scale = self.scale_softmax_log2[0] * Float32(
             self.vc_q_scale[(head, q_slot)]
         )
-        num_threads = len(self.cfg.softmax0_warp_ids) * cute.arch.WARP_SIZE
-        barrier_id = self.cfg.vc_kscale_barrier_id + self.q_half
-        table = self._vc_kscale_table(stage_info)
-        num_tiles = Int32(self.cfg.vc_max_kv_tiles)
-        lbk = Int32(self.cfg.kv_tile_n.bit_length() - 1)
-        k_base = ((batch_coord * Int32(self.cfg.vc_seq_len_k)) >> lbk) + batch_coord
-        warp_id_in_sg = cute.arch.warp_idx() % len(self.cfg.softmax0_warp_ids)
-        thread = warp_id_in_sg * cute.arch.WARP_SIZE + cute.arch.lane_idx()
-        cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
-        for pass_idx in cutlass.range_constexpr(
-            (self.cfg.vc_kscale_table_bytes // 4 + num_threads - 1) // num_threads
-        ):
-            tile_idx = Int32(pass_idx * num_threads) + thread
-            if tile_idx < num_tiles:
-                table[tile_idx] = Float32(self.vc_k_scale[(kv_head, k_base + tile_idx)])
-        cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
-        return row_scale, Float32(0.0), Float32(table[Int32(0)])
+        k_base = vc_flat_k_base(batch_coord, self.cfg.vc_seq_len_k, self.cfg.kv_tile_n)
+        first_k_scale = self._vc_k_scales.fill(
+            stage_info, self.vc_k_scale, kv_head, k_base
+        )
+        return row_scale, Float32(0.0), first_k_scale
 
     @consumer_work(returns=(old_row_max, row_max, vc_k_scale_next))
     @cute.jit
@@ -3417,12 +3391,9 @@ class TmemSPResource(MemoryResource):
     ) -> tuple[SoftmaxScalar, SoftmaxScalar, Float32]:
         """VC-Attention K-loop row max: scale the tile maximum into log2 units with
         ``vc_row_scale * sfK[tile]`` (prefetched) and read the next tile's ``sfK``."""
-        table = self._vc_kscale_table(stage_info)
-        next_idx = cute.math.min(
-            Int32(stage_info.loop_offset) + Int32(1),
-            Int32(self.cfg.vc_kscale_table_bytes // 4) - Int32(1),
+        k_scale_after = self._vc_k_scales.next_scale(
+            stage_info, Int32(stage_info.loop_offset)
         )
-        k_scale_after = Float32(table[next_idx])
         tile_scale = vc_row_scale * vc_k_scale_next
         s_data = self._load_s_chunks(stage_info)
         old_row_max, new_row_max = self._reduce_row_max(s_data, row_max, tile_scale)
