@@ -1971,6 +1971,8 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
     cfg.kv_stage_k = cfg.kv_stage
     cfg.kv_stage_v = cfg.kv_stage
     if not cfg.split_kv_pipelines:
+        # Same-width K and V share one ring: deepen it to what the SMEM budget
+        # allows after every other buffer, as FA4 does.
         n_stages = max(
             cfg.kv_stage,
             _infer_single_instance_kv_stages(
@@ -2012,7 +2014,9 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
     cfg.kv_stage_v = n_stages
 
 
-def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
+def _configure_pipeline_stages(
+    cfg: FmhaConfig, *, is_clc_dynamic: bool, is_persistent: bool
+) -> None:
     """Set topology- and capacity-derived context pipeline stage counts."""
     cfg.q_stage = cfg.num_qkv_instances
     # Stages using Two-CTA method are half-tiles, where the peer CTA holds the
@@ -2022,6 +2026,9 @@ def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None
     cfg.stage_scoped_tmem_stats = cfg.has_tmem_p_pipeline
     cfg.mma_softmax_stage = 2 if cfg.has_tmem_p_pipeline else 1
     cfg.softmax_corr_stage = 2 if cfg.stage_scoped_tmem_stats else 1
+    # The early-sum policy decides the P-prefix barriers, so settle it before
+    # the K/V ring is sized against the remaining SMEM.
+    _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
     # A single Q instance always reuses one physical O accumulator. Allow only
     # one outstanding PV result so correction finishes before the next PV.
     # StatsDone protects statistics, and is released before O correction;
@@ -2983,7 +2990,9 @@ class FmhaTs:
         if head_paired:
             _configure_head_paired_tilers(cfg, mma_tiler_mn=mma_tiler_mn, d=d)
             _configure_head_dim_staging(cfg)
-            _configure_pipeline_stages(cfg, is_clc_dynamic=is_clc_dynamic)
+            _configure_pipeline_stages(
+                cfg, is_clc_dynamic=is_clc_dynamic, is_persistent=is_persistent
+            )
             if cfg.single_qkv_instance:
                 _configure_single_instance_tmem_layout(cfg)
                 _configure_single_instance_warp_layout(cfg)
@@ -3005,7 +3014,6 @@ class FmhaTs:
                 window_size_left=window_size_left,
                 has_variable_window=has_variable_window,
             )
-            _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
             return
 
         # MMA tiler: (M, N, K) = (128, 128, 128)
@@ -3017,7 +3025,9 @@ class FmhaTs:
         if vc_attention and not cfg.p_in_smem:
             raise ValueError("VC-Attention requires P staged in SMEM")
         _configure_head_dim_staging(cfg)
-        _configure_pipeline_stages(cfg, is_clc_dynamic=is_clc_dynamic)
+        _configure_pipeline_stages(
+            cfg, is_clc_dynamic=is_clc_dynamic, is_persistent=is_persistent
+        )
         if cfg.single_qkv_instance:
             _configure_single_instance_tmem_layout(cfg)
             _configure_single_instance_warp_layout(cfg)
@@ -3094,7 +3104,6 @@ class FmhaTs:
             window_size_left=window_size_left,
             has_variable_window=has_variable_window,
         )
-        _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
         if vc_attention and not cfg.enable_early_tile_sum:
             raise ValueError("VC-Attention requires the scalar early tile sum")
 
