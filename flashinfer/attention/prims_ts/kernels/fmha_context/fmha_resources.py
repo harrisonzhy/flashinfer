@@ -602,8 +602,6 @@ class FmhaConfig:
     # Pipeline stages
     q_stage: int = 2
     kv_stage: int = 3
-    # Upper bound for the budget-derived shared K/V ring depth (0 keeps the fixed default).
-    kv_stage_max: int = 0
     # Hand the S0/S1 pacing token back before the exp2/P work on the fp8 P-in-SMEM path
     # (as the TMEM-P fp8 cadence does), so the peer softmax group starts its row max
     # while this group computes P.

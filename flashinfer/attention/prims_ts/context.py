@@ -301,7 +301,6 @@ def _make_context_kernel(
     vc_attention: bool = False,
     vc_q_block_log2: int = 7,
     vc_num_q_heads: int = 0,
-    kv_stage_max: int | None = None,
     fp8_psmem_early_token: bool = False,
 ):
     """Build one context kernel from its batch-independent static topology."""
@@ -354,7 +353,6 @@ def _make_context_kernel(
         vc_attention=vc_attention,
         vc_q_block_log2=vc_q_block_log2,
         vc_num_q_heads=vc_num_q_heads,
-        kv_stage_max=kv_stage_max,
         fp8_psmem_early_token=fp8_psmem_early_token,
         **paged_kwargs,
     )
@@ -549,17 +547,14 @@ def _default_exp2_fma_pairs(device_index: int, v_dtype) -> int:
     return 4 if v_dtype.width == 16 else 3
 
 
-# SM103 (B300) tuning of the fp8 P-in-SMEM path (2026-09-30, umb-b300-dp-148): early S0/S1
-# token and a budget-derived K/V ring instead of the fixed 3 stages.
+# SM103 (B300) tuning of the fp8 P-in-SMEM path (2026-09-30, umb-b300-dp-148).
 _SM103_FP8_PSMEM_EARLY_TOKEN = True
-_SM103_KV_STAGE_MAX = 8
 
 
 def _sm103_fp8_tuning(device_index: int) -> dict:
     if torch.cuda.get_device_capability(device_index) != (10, 3):
         return {}
     return dict(
-        kv_stage_max=_SM103_KV_STAGE_MAX,
         fp8_psmem_early_token=_SM103_FP8_PSMEM_EARLY_TOKEN,
     )
 

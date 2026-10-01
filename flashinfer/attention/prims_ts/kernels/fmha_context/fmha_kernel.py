@@ -1971,20 +1971,15 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
     cfg.kv_stage_k = cfg.kv_stage
     cfg.kv_stage_v = cfg.kv_stage
     if not cfg.split_kv_pipelines:
-        # Same-width K and V share one ring: deepen it to what the SMEM budget
-        # allows (up to cfg.kv_stage_max), as FA4 does; the previous fixed 3 (6
-        # under two-CTA) left ~80 KB unused on the fp8 path.
-        if cfg.kv_stage_max > cfg.kv_stage:
-            n_stages = min(
-                cfg.kv_stage_max,
-                _infer_single_instance_kv_stages(
-                    cfg, is_clc_dynamic=is_clc_dynamic, require_cadence=False
-                ),
-            )
-            n_stages = max(cfg.kv_stage, n_stages)
-            cfg.kv_stage = n_stages
-            cfg.kv_stage_k = n_stages
-            cfg.kv_stage_v = n_stages
+        n_stages = max(
+            cfg.kv_stage,
+            _infer_single_instance_kv_stages(
+                cfg, is_clc_dynamic=is_clc_dynamic, require_cadence=False
+            ),
+        )
+        cfg.kv_stage = n_stages
+        cfg.kv_stage_k = n_stages
+        cfg.kv_stage_v = n_stages
         return
     # Mixed dtypes require separate K and V rings. Size each ring from one
     # cadence up to cfg.kv_stage against the shared SMEM budget.
@@ -2006,9 +2001,7 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
     # K and V share the same head_dim and head_dim_per_stage_kv, so their
     # minimum ring depths (num_head_dim_stages) are equal and both rings are sized identically.
     cadence = cfg.num_head_dim_stages_k
-    n_stages = min(
-        cfg.kv_stage, budget_bytes // (k_stage_footprint + v_stage_footprint)
-    )
+    n_stages = budget_bytes // (k_stage_footprint + v_stage_footprint)
     if n_stages < cadence:
         raise ValueError(
             f"split K/V staging requires at least {cadence} stages per ring "
@@ -2834,7 +2827,6 @@ class FmhaTs:
         vc_attention: bool = False,
         vc_q_block_log2: int = 7,
         vc_num_q_heads: int = 0,
-        kv_stage_max: int | None = None,
         fp8_psmem_early_token: bool = False,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
@@ -2937,8 +2929,6 @@ class FmhaTs:
         cfg.vc_attention = vc_attention
         cfg.vc_q_block_log2 = vc_q_block_log2
         cfg.vc_num_q_heads = vc_num_q_heads
-        if kv_stage_max is not None:
-            cfg.kv_stage_max = kv_stage_max
         cfg.fp8_psmem_early_token = fp8_psmem_early_token
         self.cfg = cfg
         # Compact Q and staged O fit two resident query tiles plus the K/V
