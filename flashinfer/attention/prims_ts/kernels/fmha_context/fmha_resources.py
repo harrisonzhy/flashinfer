@@ -173,6 +173,10 @@ VC_EXPCAST = True
 # byte-shift decode into fp32 (4 SHL + 2 FADD2 per quad). f16 holds the tile sum
 # exactly in range (<= 128 * 256) and rounds each add to 2^-11.
 VC_EXPCAST_F16_SUM = True
+# Pack the codes through cvt.rn.relu.f16x2.f32 + an f16 +1024 magic FMA and one prmt
+# (fi-vcmain-perf-wt form: 2 fewer ALU ops, 2 more conversion-unit ops per quad)
+# instead of the fp32 magic FMA and three prmt.
+VC_EXPCAST_RELU_PACK = True
 
 
 @cute.jit
@@ -345,6 +349,74 @@ def _expcast_e4m3_quad_f16init(
         }""",
         write_only_types=[Int32, Int32, Int32],
         read_only_args=[t0, t1, t2, t3],
+    )
+
+
+@cute.jit
+def _expcast_e4m3_quad_relu(
+    c0: Float32,
+    c1: Float32,
+    c2: Float32,
+    c3: Float32,
+    acc01: Int32,
+    acc23: Int32,
+) -> tuple[Int32, Int32, Int32]:
+    """Code pack and f16x2 row-sum accumulate of fi-vcmain-perf-wt: inputs are
+    the unclamped codes ``c = 8*(s*scale - m) + 56 + beta`` in code units;
+    ``cvt.rn.relu.f16x2.f32`` packs a pair and clamps underflow to code 0, an
+    f16 FMA adds 1024 so the low byte of each half is the round-to-nearest-even
+    code, one ``prmt`` gathers the four bytes, then the E4M3-pair to f16x2
+    conversion and one f16 FMA per pair accumulate the row sum."""
+    return cute.arch.inline_ptx(
+        """
+        {
+            .reg .b32 h01, h23, y01, y23, v01, v23, a01, a23, r01, r23, one2, k1024;
+            .reg .b16 c01, c23;
+            mov.b32 one2, 0x3C003C00;
+            mov.b32 k1024, 0x64006400;
+            mov.b32 a01, {$r4};
+            mov.b32 a23, {$r5};
+            cvt.rn.relu.f16x2.f32 h01, {$r1}, {$r0};
+            cvt.rn.relu.f16x2.f32 h23, {$r3}, {$r2};
+            fma.rn.f16x2 y01, h01, one2, k1024;
+            fma.rn.f16x2 y23, h23, one2, k1024;
+            prmt.b32 {$w0}, y01, y23, 0x6420;
+            mov.b32 {c01, c23}, {$w0};
+            cvt.rn.f16x2.e4m3x2 v01, c01;
+            cvt.rn.f16x2.e4m3x2 v23, c23;
+            fma.rn.f16x2 r01, v01, one2, a01;
+            fma.rn.f16x2 r23, v23, one2, a23;
+            mov.b32 {$w1}, r01;
+            mov.b32 {$w2}, r23;
+        }""",
+        write_only_types=[Int32, Int32, Int32],
+        read_only_args=[c0, c1, c2, c3, acc01, acc23],
+    )
+
+
+@cute.jit
+def _expcast_e4m3_quad_relu_init(
+    c0: Float32, c1: Float32, c2: Float32, c3: Float32
+) -> tuple[Int32, Int32, Int32]:
+    """First quad of a chain for :func:`_expcast_e4m3_quad_relu` (zero accumulators)."""
+    return cute.arch.inline_ptx(
+        """
+        {
+            .reg .b32 h01, h23, y01, y23, one2, k1024;
+            .reg .b16 c01, c23;
+            mov.b32 one2, 0x3C003C00;
+            mov.b32 k1024, 0x64006400;
+            cvt.rn.relu.f16x2.f32 h01, {$r1}, {$r0};
+            cvt.rn.relu.f16x2.f32 h23, {$r3}, {$r2};
+            fma.rn.f16x2 y01, h01, one2, k1024;
+            fma.rn.f16x2 y23, h23, one2, k1024;
+            prmt.b32 {$w0}, y01, y23, 0x6420;
+            mov.b32 {c01, c23}, {$w0};
+            cvt.rn.f16x2.e4m3x2 {$w1}, c01;
+            cvt.rn.f16x2.e4m3x2 {$w2}, c23;
+        }""",
+        write_only_types=[Int32, Int32, Int32],
+        read_only_args=[c0, c1, c2, c3],
     )
 
 
@@ -4106,6 +4178,44 @@ class TmemSPResource(MemoryResource):
         )
         s_data = _tmem_sp_sdata.pop(id(self))
         packed_words: tuple[Any, ...] = ()
+        if cutlass.const_expr(VC_EXPCAST_F16_SUM and VC_EXPCAST_RELU_PACK):
+            # Codes in code units (not /256): relu pack clamps underflow.
+            code_scale_u = scale * Float32(8.0)
+            code_bias_u = minus_row_max_scale * Float32(8.0) + Float32(
+                120.0 + VC_EXPCAST_BETA
+            )
+            acc: list[Any] = [None] * 4
+            for chunk_idx in cutlass.range_constexpr(num_chunks):
+                for elem_idx in cutlass.range_constexpr(0, tmem_x, 4):
+                    quad_idx = (chunk_idx * tmem_x + elem_idx) // 4
+                    chain = 2 * (quad_idx % 2)
+                    c0, c1 = cute.arch.fma_packed_f32x2(
+                        (s_data[chunk_idx][elem_idx], s_data[chunk_idx][elem_idx + 1]),
+                        (code_scale_u, code_scale_u),
+                        (code_bias_u, code_bias_u),
+                    )
+                    c2, c3 = cute.arch.fma_packed_f32x2(
+                        (
+                            s_data[chunk_idx][elem_idx + 2],
+                            s_data[chunk_idx][elem_idx + 3],
+                        ),
+                        (code_scale_u, code_scale_u),
+                        (code_bias_u, code_bias_u),
+                    )
+                    if cutlass.const_expr(quad_idx < 2):
+                        word, acc_lo, acc_hi = _expcast_e4m3_quad_relu_init(
+                            c0, c1, c2, c3
+                        )
+                    else:
+                        word, acc_lo, acc_hi = _expcast_e4m3_quad_relu(
+                            c0, c1, c2, c3, acc[chain], acc[chain + 1]
+                        )
+                    acc[chain] = acc_lo
+                    acc[chain + 1] = acc_hi
+                    packed_words += (word,)
+            _tmem_sp_pwords[id(self)] = packed_words
+            cute.arch.fence_view_async_tmem_store()
+            return _f16x2_sum4(acc[0], acc[1], acc[2], acc[3])
         if cutlass.const_expr(VC_EXPCAST_F16_SUM):
             # Two independent f16x2 accumulator pairs (16 pair-adds each per tile).
             acc: list[Any] = [None] * 4
