@@ -2527,7 +2527,10 @@ def create_softmax_task(
                     seq.wait()
                 # FP8 returns the pacing token before P work. Its SP release
                 # still follows every P store's completion.
-                if tmem_sp.cfg.uses_d128_fp8_softmax_cadence:
+                early_token = tmem_sp.cfg.uses_d128_fp8_softmax_cadence or (
+                    p_in_smem and tmem_sp.cfg.fp8_psmem_early_token
+                )
+                if early_token:
                     if index == 0:
                         seq.commit()
                     else:
@@ -2539,7 +2542,7 @@ def create_softmax_task(
                     scale_softmax_log2=scale_softmax_log2,
                     old_row_max=old_row_max,
                 )
-                if s0s1_seq is None or tmem_sp.cfg.uses_d128_fp8_softmax_cadence:
+                if s0s1_seq is None or early_token:
                     pass
                 elif index == 0:
                     seq.commit()

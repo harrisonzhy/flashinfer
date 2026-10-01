@@ -301,6 +301,8 @@ def _make_context_kernel(
     vc_attention: bool = False,
     vc_q_block_log2: int = 7,
     vc_num_q_heads: int = 0,
+    kv_stage_max: int | None = None,
+    fp8_psmem_early_token: bool = False,
 ):
     """Build one context kernel from its batch-independent static topology."""
 
@@ -352,6 +354,8 @@ def _make_context_kernel(
         vc_attention=vc_attention,
         vc_q_block_log2=vc_q_block_log2,
         vc_num_q_heads=vc_num_q_heads,
+        kv_stage_max=kv_stage_max,
+        fp8_psmem_early_token=fp8_psmem_early_token,
         **paged_kwargs,
     )
     fmha.cfg.exp2_fma_pairs = exp2_fma_pairs
@@ -536,11 +540,28 @@ def _dsl_supports_ldtm_stat() -> bool:
 
 
 def _default_exp2_fma_pairs(device_index: int, v_dtype) -> int:
-    """FMA-pipe exp2 pairs per 16-pair softmax chunk: 4 for 16-bit V on SM100,
-    where MUFU bounds the softmax, 0 elsewhere."""
+    """FMA-pipe exp2 pairs per 16-pair softmax chunk on SM100, where MUFU bounds
+    the softmax: 4 for 16-bit V, 3 on the fp8 P-in-SMEM path (measured optima; a
+    larger share costs more issue slots than it saves on MUFU). 0 elsewhere,
+    including SM103, where the emulation loses 4-6%."""
     if torch.cuda.get_device_capability(device_index) != (10, 0):
         return 0
-    return 4 if v_dtype.width == 16 else 0
+    return 4 if v_dtype.width == 16 else 3
+
+
+# SM103 (B300) tuning of the fp8 P-in-SMEM path (2026-09-30, umb-b300-dp-148): early S0/S1
+# token and a budget-derived K/V ring instead of the fixed 3 stages.
+_SM103_FP8_PSMEM_EARLY_TOKEN = True
+_SM103_KV_STAGE_MAX = 8
+
+
+def _sm103_fp8_tuning(device_index: int) -> dict:
+    if torch.cuda.get_device_capability(device_index) != (10, 3):
+        return {}
+    return dict(
+        kv_stage_max=_SM103_KV_STAGE_MAX,
+        fp8_psmem_early_token=_SM103_FP8_PSMEM_EARLY_TOKEN,
+    )
 
 
 def _default_two_cta_umma(device_index: int) -> bool:
@@ -1630,8 +1651,12 @@ def _resolve_paged_plan_geometry(
 def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
     """Dense contiguous MHA at D=128 (bf16 or E4M3 Q/K) runs the two-CTA UMMA
     form, which pairs Q tiles through the grid."""
+    # VC-Attention stays one-CTA: on B300 its two-CTA form is 5% slower at
+    # 75.6k tokens (23.4 vs 22.3 ms, B=1 H=16), as the tile-mean ring and
+    # row-sum operand add per-CTA SMEM traffic the halved K/V load does not repay.
     return (
         _default_two_cta_umma(geometry.device_index)
+        and not geometry.vc_attention
         and geometry.head_dim == 128
         and geometry.head_dim_vo in (None, 128)
         and geometry.mask_type == "dense"
@@ -1829,6 +1854,7 @@ def _get_compiled_context(
         vc_attention=vc_attention,
         vc_q_block_log2=vc_q_block_log2,
         vc_num_q_heads=num_qo_heads if vc_attention else 0,
+        **_sm103_fp8_tuning(device_index),
     )
     if vc_attention:
         fmha.cfg.vc_head_dim_v = head_dim_vo

@@ -511,13 +511,6 @@ def _pack_float4_to_fp8_e4m3(
     )
 
 
-# Each softmax thread computes its 32-key chunk of P as 16 exp2 pairs. This many
-# of them use the FMA-pipe polynomial instead of MUFU, whose throughput bounds the
-# softmax. Measured optimum for paired D128. A larger share is slower because the
-# polynomial's dependent arithmetic costs more issue slots than it saves on MUFU.
-_FP8_EXP2_FMA_PAIRS_PER_CHUNK = 3
-
-
 @cute.jit
 def _f32_bits(x: Float32) -> Int32:
     return cutlass.Vector.from_elements((x,), Float32).bitcast(Int32)[0]
@@ -609,6 +602,12 @@ class FmhaConfig:
     # Pipeline stages
     q_stage: int = 2
     kv_stage: int = 3
+    # Upper bound for the budget-derived shared K/V ring depth (0 keeps the fixed default).
+    kv_stage_max: int = 0
+    # Hand the S0/S1 pacing token back before the exp2/P work on the fp8 P-in-SMEM path
+    # (as the TMEM-P fp8 cadence does), so the peer softmax group starts its row max
+    # while this group computes P.
+    fp8_psmem_early_token: bool = False
     # One TMA pipeline has one expected-transaction byte count per stage, so K
     # and V share a ring of kv_stage stages only while their dtype widths
     # match. Mixed widths set split_kv_pipelines and size one ring per side.
@@ -4045,7 +4044,7 @@ class TmemSPResource(MemoryResource):
             local_sum_pair_2 = (Float32(0.0), Float32(0.0))
             local_sum_pair_3 = (Float32(0.0), Float32(0.0))
         # With P in SMEM, the last pairs of each chunk take the FMA-pipe exp2.
-        fma_pairs_per_chunk = _FP8_EXP2_FMA_PAIRS_PER_CHUNK if self.cfg.p_in_smem else 0
+        fma_pairs_per_chunk = self.cfg.exp2_fma_pairs if self.cfg.p_in_smem else 0
         for chunk_idx in cutlass.range_constexpr(num_chunks):
             p_vals = ()
             for elem_idx in cutlass.range_constexpr(0, tmem_x, 2):
