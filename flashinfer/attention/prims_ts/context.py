@@ -1645,7 +1645,11 @@ def _resolve_paged_plan_geometry(
 
 def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
     """Dense contiguous MHA at D=128 (bf16 or E4M3 Q/K) runs the two-CTA UMMA
-    form, which pairs Q tiles through the grid."""
+    form, which pairs Q tiles through the grid.
+    The two-CTA launch is non-persistent with heads on grid Y and batch on
+    grid Z. CUDA limits grid Y and Z to 65,535; oversized geometries keep the
+    persistent flattened grid so every otherwise-valid int32 plan stays
+    launchable."""
     # VC-Attention stays one-CTA: on B300 its two-CTA form is 5% slower at
     # 75.6k tokens (23.4 vs 22.3 ms, B=1 H=16), as the tile-mean ring and
     # row-sum operand add per-CTA SMEM traffic the halved K/V load does not repay.
@@ -1660,6 +1664,10 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
         and geometry.num_qo_heads == geometry.num_kv_heads
         and torch.finfo(geometry.qk_dtype).bits in (8, 16)
         and torch.finfo(geometry.pv_dtype).bits in (8, 16)
+        and not (
+            geometry.batch_size > _CUDA_GRID_YZ_MAX
+            or geometry.num_qo_heads > _CUDA_GRID_YZ_MAX
+        )
     )
 
 
