@@ -407,6 +407,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     lse_scale: float,
     kv_scale_format: str,
     kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"] = "fp8",
+    backend: Literal["sparse", "cake"] = "sparse",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if not is_sm12x_supported(query.device):
         raise ValueError(
@@ -489,12 +490,40 @@ def _trtllm_batch_decode_sparse_mla_sm120(
             )
         return out
 
-    from ._sparse_mla_sm120._prepared import functional_run
-
     if return_lse and out_lse_arg is None:
         out_lse_arg = torch.empty(
             flat_lse_shape, dtype=torch.float32, device=query.device
         )
+    if backend == "cake":
+        from ._sparse_mla_sm120._cake_dsv4_nvfp4 import (
+            functional_run as cake_functional_run,
+        )
+
+        out_lse = cake_functional_run(
+            query_flat,
+            kv_cache,
+            primary_segment.indices,
+            out_flat,
+            workspace_buffer,
+            float(sm_scale),
+            lengths=primary_segment.lengths,
+            sink=_normalize_optional_mla_sink(sinks, "backend='cake'"),
+            extra=extra_segment.kv_cache if extra_segment is not None else None,
+            extra_indices=(
+                extra_segment.indices if extra_segment is not None else None
+            ),
+            extra_lengths=(
+                extra_segment.lengths if extra_segment is not None else None
+            ),
+            lse=out_lse_arg,
+            lse_scale=lse_scale,
+        )
+        if return_lse:
+            return out, user_lse if user_lse is not None else out_lse
+        return out
+
+    from ._sparse_mla_sm120._prepared import functional_run
+
     out_lse = functional_run(
         query_flat,
         kv_cache,
@@ -1205,7 +1234,10 @@ def _resolve_dsv4_sparse_mla_backend(
     ] = "auto",
 ) -> Literal["trtllm-gen", "cute-dsl", "sparse", "cake"]:
     cc = get_compute_capability(device)
-    is_sm100_family = cc in ((10, 0), (10, 3))
+    is_sm100_family = cc in ((10, 0), (10, 3), (10, 7))
+    # CuTe DSL HCA and the SM100 CAKE kernels require SM100/SM103;
+    # only the prebuilt cubin backend additionally covers SM107.
+    is_sm100_or_sm103 = cc in ((10, 0), (10, 3))
     is_sm120_family = cc in ((12, 0), (12, 1))
     if requested_backend == "auto":
         if is_sm120_family:
@@ -1213,7 +1245,7 @@ def _resolve_dsv4_sparse_mla_backend(
         if is_sm100_family:
             return "trtllm-gen"
         raise ValueError(
-            "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
+            "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103/SM107 via "
             f"TRTLLM-GEN or SM120/SM121 via sparse backend, got SM{cc[0]}{cc[1]}"
         )
     if requested_backend not in ("trtllm-gen", "cute-dsl", "sparse", "cake"):
@@ -1221,15 +1253,25 @@ def _resolve_dsv4_sparse_mla_backend(
             "backend must be one of 'auto', 'trtllm-gen', 'cute-dsl', "
             f"'sparse', or 'cake', got {requested_backend!r}"
         )
-    if requested_backend in ("trtllm-gen", "cute-dsl") and not is_sm100_family:
+    if requested_backend == "trtllm-gen" and not is_sm100_family:
         raise ValueError(
-            f"backend={requested_backend!r} requires SM100/SM103, got SM{cc[0]}{cc[1]}"
+            f"backend={requested_backend!r} requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
+        )
+    if requested_backend == "cute-dsl" and not is_sm100_or_sm103:
+        raise ValueError(
+            f"backend='cute-dsl' requires SM100/SM103, got SM{cc[0]}{cc[1]}"
         )
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
-    if requested_backend == "cake" and not is_sm100_family:
-        raise ValueError(f"backend='cake' requires SM100/SM103, got SM{cc[0]}{cc[1]}")
+    if requested_backend == "cake" and not (is_sm100_or_sm103 or is_sm120_family):
+        raise ValueError(
+            f"backend='cake' requires SM100/SM103 or SM120/SM121, got SM{cc[0]}{cc[1]}"
+        )
     return cast(Literal["trtllm-gen", "cute-dsl", "sparse", "cake"], requested_backend)
+
+
+def _is_sm120_family(device: torch.device) -> bool:
+    return get_compute_capability(device) in ((12, 0), (12, 1))
 
 
 def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
@@ -1249,9 +1291,16 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     sinks: Optional[torch.Tensor],
     kv_layout: Literal["HND", "NHD"],
     kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"],
+    backend: Literal["sparse", "cake"] = "sparse",
 ) -> torch.Tensor:
     if bmm2_scale != 1.0:
         raise ValueError("SM120 DSv4 sparse MLA does not support bmm2_scale")
+    cake = backend == "cake"
+    if cake and kv_cache_format != "nvfp4":
+        raise ValueError(
+            "backend='cake' on SM120/SM121 serves the NVFP4 DSv4 cache only; "
+            f"pass kv_cache_format='nvfp4' (got {kv_cache_format!r})"
+        )
     if query.ndim in (3, 4):
         num_heads, head_dim = query.shape[-2:]
     else:
@@ -1262,14 +1311,25 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
         )
     if head_dim != 512:
         raise ValueError(f"Expected DSv4 query head dim 512, got {head_dim}")
-    if num_heads not in (8, 16, 32, 64, 128):
+    if cake:
+        from ._sparse_mla_sm120._cake_dsv4_nvfp4 import (
+            cake_sparse_mla_sm120_dsv4_nvfp4_supported_heads,
+        )
+
+        cake_heads = cake_sparse_mla_sm120_dsv4_nvfp4_supported_heads()
+        if num_heads not in cake_heads:
+            raise ValueError(
+                f"backend='cake' SM120 DSv4 NVFP4 sparse MLA supports {cake_heads} "
+                f"query heads, got {num_heads}"
+            )
+    elif num_heads not in (8, 16, 32, 64, 128):
         raise ValueError(
             "Expected 8, 16, 32, 64, or 128 query heads for SM120 DSv4 "
             f"sparse MLA, got {num_heads}"
         )
     if swa_topk_lens is None:
-        raise ValueError("backend='sparse' requires swa_topk_lens")
-    if kv_cache_format == "nvfp4" and num_heads == 8:
+        raise ValueError(f"backend={backend!r} requires swa_topk_lens")
+    if kv_cache_format == "nvfp4" and num_heads == 8 and not cake:
         raise ValueError("NVFP4 sparse MLA does not yet support 8 query heads")
 
     # Packed FP8 row width per cache format: DSV4 is 584B (448B FP8 + 128B
@@ -1300,7 +1360,15 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             if swa_kv_cache.ndim == 3 or kv_layout == "NHD"
             else swa_kv_cache.shape[2]
         )
-        if primary_page_size != 64:
+        if cake:
+            # The Cake kernels take the page size and page stride at runtime.
+            if primary_page_size < 1 or swa_kv_cache.stride(0) % 16:
+                raise ValueError(
+                    "backend='cake' NVFP4 primary cache needs a positive page size "
+                    "and a 16-byte multiple page stride, got page_size="
+                    f"{primary_page_size} stride={swa_kv_cache.stride(0)}"
+                )
+        elif primary_page_size != 64:
             raise ValueError(
                 "NVFP4 sparse MLA primary cache requires page_size=64, got "
                 f"{primary_page_size}"
@@ -1325,7 +1393,7 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     if (extra_sparse_indices is None) != (extra_sparse_topk_lens is None):
         raise ValueError(
             "extra_sparse_indices and extra_sparse_topk_lens must be provided "
-            "together for backend='sparse'"
+            f"together for backend={backend!r}"
         )
     query_for_sm120 = query if query.ndim == 4 else query.unsqueeze(1)
     out_for_sm120 = out if out is None or out.ndim == 4 else out.unsqueeze(1)
@@ -1360,7 +1428,14 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
                 if compressed_kv_cache.ndim == 3 or kv_layout == "NHD"
                 else compressed_kv_cache.shape[2]
             )
-            if extra_page_size not in (2, 64):
+            if cake:
+                if extra_page_size < 1 or compressed_kv_cache.stride(0) % 16:
+                    raise ValueError(
+                        "backend='cake' NVFP4 extra cache needs a positive page "
+                        "size and a 16-byte multiple page stride, got page_size="
+                        f"{extra_page_size} stride={compressed_kv_cache.stride(0)}"
+                    )
+            elif extra_page_size not in (2, 64):
                 raise ValueError(
                     "NVFP4 sparse MLA extra cache requires page_size 2 or 64, "
                     f"got {extra_page_size}"
@@ -1413,6 +1488,7 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
                 else "auto"
             ),
             kv_cache_format=kv_cache_format,
+            backend=backend,
         ),
     )
     if query.ndim == 3:
@@ -1760,7 +1836,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
 
     The implementation is selected from the query device architecture.
 
-    On SM100/SM103, this calls the TRTLLM-GEN DeepSeek V4 sparse MLA kernels.
+    On SM100/SM103/SM107, this calls the prebuilt DeepSeek V4 sparse MLA cubins.
     The query and both KV pools use head dim 512. The query may be BF16 or
     per-tensor FP8 E4M3 and the default output is BF16. When
     ``dsv4_inv_rope_cos_sin_cache`` is provided, the fixed TRTLLM-GEN
@@ -1789,6 +1865,22 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     matching the TRTLLM-GEN dynamic-token-sparse ABI, while its compressed
     stream consumes physical page IDs. HCA currently accepts dense FP8 E4M3
     query/KV tensors and produces BF16 output.
+
+    With ``backend="cake"`` on SM120/SM121 and ``kv_cache_format="nvfp4"``,
+    this calls the Cake SM120 NVFP4 sparse-MLA kernels through the
+    SM120 ``"sparse"`` call surface (``swa_topk_lens``, optional
+    ``compressed_kv_cache`` + ``extra_sparse_indices`` /
+    ``extra_sparse_topk_lens``, ``sinks``, HND / NHD / 3-D packed caches).
+    That route takes the main and extra page sizes at runtime (any positive
+    page size, 16-byte multiple page stride) and serves 8, 16, 32, 48, 64, 80,
+    96, 112 and 128 query heads; ``workspace_buffer`` holds the split-K
+    partials and the LSE (size it with
+    :func:`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes`).
+    Every call runs either the split decode kernel or the single-launch
+    prefill kernel (one CTA per token and head block over all of its
+    candidates, no split scratch) as chosen by
+    :func:`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`
+    from the measured crossover of the two sm_120a SKUs.
 
     With ``backend="cake"`` on SM100/SM103, this calls the source-level CAKE
     kernels (``flashinfer.mla.cake_dsv4``). The metadata may describe fewer
@@ -1820,8 +1912,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     query : torch.Tensor
         Dense query input ``[batch_size, q_len_per_request, num_heads, 512]``
         or varlen query input ``[sum_q, num_heads, 512]`` when
-        ``cum_seq_lens_q`` is provided. SM100/SM103 accepts BF16 or FP8 E4M3;
-        SM120/SM121 accepts BF16.
+        ``cum_seq_lens_q`` is provided. SM100/SM103/SM107 accept BF16 or FP8
+        E4M3; SM120/SM121 accepts BF16.
     swa_kv_cache : torch.Tensor
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses an opaque
         packed uint8 record with last dimension 584 (FP8), 528 (DSV4.1 FP8) or
@@ -1913,10 +2005,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``sparse_topk_lens_offset``).
     backend : {"auto", "trtllm-gen", "cute-dsl", "sparse", "cake"}
         Backend selection. ``"auto"`` preserves the architecture-based default:
-        TRTLLM-GEN on SM100/SM103 and sparse on SM120/SM121. HCA is selected
+        the prebuilt cubins on SM100/SM103/SM107 and sparse on SM120/SM121. HCA is selected
         only when ``"cute-dsl"`` is requested explicitly. Source-level CAKE
-        kernels are selected only when ``"cake"`` is requested explicitly on
-        SM100/SM103.
+        kernels are selected only when ``"cake"`` is requested explicitly: on
+        SM100/SM103 the FP8/BF16 DSv4 family, on SM120/SM121 the NVFP4 DSv4
+        sparse-MLA decode (``kv_cache_format="nvfp4"`` only).
     hca_swa_indices : Optional[torch.Tensor]
         Absolute SWA token-row indices, shape ``[B * Q, 128]`` INT32. Ring
         rotation and wraparound are supported. Every entry, including masked
@@ -2034,7 +2127,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     if kv_cache_format == "fp8_dsv41_fp4_ca" and backend != "sparse":
         raise ValueError("kv_cache_format='fp8_dsv41_fp4_ca' requires backend='sparse'")
     if kv_cache_format == "nvfp4" and backend != "sparse":
-        raise ValueError("kv_cache_format='nvfp4' requires backend='sparse'")
+        if backend != "cake" or not _is_sm120_family(query.device):
+            raise ValueError(
+                "kv_cache_format='nvfp4' requires backend='sparse' (or "
+                "backend='cake' on SM120/SM121)"
+            )
 
     rope_quant = dsv4_inv_rope_cos_sin_cache is not None
     if dsv4_output_scale is not None and not rope_quant:
@@ -2209,6 +2306,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             + ", ".join(unexpected_hca_input_names)
         )
 
+    # On SM120/SM121, backend="cake" selects the Cake NVFP4 sparse-MLA decode,
+    # which shares the SM120 "sparse" call surface (swa_topk_lens, dual cache).
+    cake_sm120 = backend == "cake" and _is_sm120_family(query.device)
     if backend == "cake":
         if enable_pdl:
             raise ValueError("backend='cake' does not support enable_pdl")
@@ -2216,7 +2316,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     elif enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
     if isinstance(bmm1_scale, torch.Tensor):
-        if backend == "sparse":
+        if backend == "sparse" or cake_sm120:
             raise ValueError(
                 "SM120/SM121 DSv4 sparse MLA expects bmm1_scale to be a float"
             )
@@ -2225,16 +2325,16 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         if backend == "trtllm-gen":
             bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
-        if backend == "sparse":
+        if backend == "sparse" or cake_sm120:
             raise ValueError(
                 "SM120/SM121 DSv4 sparse MLA expects bmm2_scale to be a float"
             )
         if bmm2_scale.dtype != torch.float32:
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
 
-    if backend == "sparse":
+    if backend == "sparse" or cake_sm120:
         if sparse_indices is None:
-            raise ValueError("backend='sparse' requires sparse_indices")
+            raise ValueError(f"backend={backend!r} requires sparse_indices")
         return _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             query=query,
             swa_kv_cache=swa_kv_cache,
@@ -2251,6 +2351,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             sinks=sinks,
             kv_layout=kv_layout,
             kv_cache_format=kv_cache_format,
+            backend="cake" if cake_sm120 else "sparse",
         )
 
     if backend != "cake":

@@ -168,7 +168,9 @@ def load_manifest() -> dict[str, Any]:
         raise RuntimeError("radix sampling manifest is invalid JSON") from error
     if not isinstance(manifest, dict) or set(manifest) != _MANIFEST_KEYS:
         raise RuntimeError("radix sampling manifest schema is invalid")
-    if manifest["schema_version"] != 1 or manifest["tma_abi"] != "pointer":
+    # the radix kernels take no TMA descriptor; the bundle declares the exporter's current host ABI
+    # (``grid_constant`` since the pointer ABI was retired upstream of round 8)
+    if manifest["schema_version"] != 1 or manifest["tma_abi"] != "grid_constant":
         raise RuntimeError("radix sampling manifest identity is invalid")
     min_cc = manifest["min_compute_capability"]
     if (
@@ -201,15 +203,93 @@ def load_manifest() -> dict[str, Any]:
         raise RuntimeError(
             "radix sampling manifest: a whole-CTA tail without the two-warp tail"
         )
+    if any(not isinstance(v.get("coarse_sample"), bool) for v in manifest["stage1"]):
+        raise RuntimeError("radix sampling manifest stage-1 entries lack coarse_sample")
+    if any(v["coarse_sample"] and not v["stream"] for v in manifest["stage1"]):
+        raise RuntimeError(
+            "radix sampling manifest: a coarse-sample build of a register-resident variant"
+        )
+    if any(v["coarse_sample"] and v["fused_block_tail"] for v in manifest["stage1"]):
+        raise RuntimeError(
+            "radix sampling manifest: a build with both the coarse sample and the whole-CTA tail"
+        )
+    if any(not isinstance(v.get("spec_sample"), bool) for v in manifest["stage1"]):
+        raise RuntimeError("radix sampling manifest stage-1 entries lack spec_sample")
+    if any(v["spec_sample"] and not v["stream"] for v in manifest["stage1"]):
+        raise RuntimeError(
+            "radix sampling manifest: a speculative-sample build of a register-resident variant"
+        )
+    if any(
+        v["spec_sample"] and (v["fused_block_tail"] or v["coarse_sample"])
+        for v in manifest["stage1"]
+    ):
+        raise RuntimeError(
+            "radix sampling manifest: a speculative-sample build together with the coarse sample "
+            "or the whole-CTA tail"
+        )
+    if any(not isinstance(v.get("slab_tail"), bool) for v in manifest["stage1"]):
+        raise RuntimeError("radix sampling manifest stage-1 entries lack slab_tail")
+    if any(
+        v["slab_tail"] and not (v["stream"] and v["fused_tail"])
+        for v in manifest["stage1"]
+    ):
+        raise RuntimeError(
+            "radix sampling manifest: a slab-tail build of a variant without a streaming two-warp tail"
+        )
+    if any(
+        v["slab_tail"] and not v["coarse_sample"] and not v["spec_sample"]
+        for v in manifest["stage1"]
+    ):
+        raise RuntimeError(
+            "radix sampling manifest: the slab tail belongs to the coarse-sample and "
+            "speculative-sample twins only"
+        )
+    if any(not isinstance(v.get("coarse_push"), bool) for v in manifest["stage1"]):
+        raise RuntimeError("radix sampling manifest stage-1 entries lack coarse_push")
+    if any(
+        v["coarse_push"]
+        and (
+            not v["stream"]
+            or v["fused_block_tail"]
+            or v["coarse_sample"]
+            or v["spec_sample"]
+            or v["slab_tail"]
+        )
+        for v in manifest["stage1"]
+    ):
+        raise RuntimeError(
+            "radix sampling manifest: the pushed coarse sums belong to the default build of a "
+            "streaming variant only"
+        )
     builds = [
-        (v["cluster"], v["ept"], bool(v["stream"]), bool(v["fused_block_tail"]))
+        (
+            v["cluster"],
+            v["ept"],
+            bool(v["stream"]),
+            bool(v["fused_block_tail"]),
+            bool(v["coarse_sample"]),
+            bool(v["spec_sample"]),
+            bool(v["slab_tail"]),
+            bool(v["coarse_push"]),
+        )
         for v in manifest["stage1"]
     ]
     if len(set(builds)) != len(builds):
         raise RuntimeError("radix sampling manifest stage-1 builds are not unique")
-    if any(bt and (c, e, s, False) not in set(builds) for c, e, s, bt in builds):
+    if any(
+        (bt or ws or sp or lb or lg)
+        and (c, e, s, False, False, False, False, False) not in set(builds)
+        for c, e, s, bt, ws, sp, lb, lg in builds
+    ):
         raise RuntimeError(
-            "radix sampling manifest: a whole-CTA tail build without its default build"
+            "radix sampling manifest: a twin build without its default build"
+        )
+    if any(
+        lb and (c, e, s, False, ws, sp, False, False) not in set(builds)
+        for c, e, s, bt, ws, sp, lb, lg in builds
+    ):
+        raise RuntimeError(
+            "radix sampling manifest: a slab-tail sample build without its plain sample build"
         )
     for v in manifest["stage23"]:
         feats = v.get("features")
@@ -295,7 +375,9 @@ def _binding_source(manifest: dict[str, Any]) -> str:
     stage1 = " ".join(
         f"X({v['symbol']}, {v['cluster']}, {v['ept']}, {1 if v['stream'] else 0}, "
         f"{v['block_threads']}, {v['dynamic_smem_bytes']}, {1 if v['fused_tail'] else 0}, "
-        f"{1 if v['fused_block_tail'] else 0})"
+        f"{1 if v['fused_block_tail'] else 0}, {1 if v['coarse_sample'] else 0}, "
+        f"{1 if v['spec_sample'] else 0}, {1 if v['slab_tail'] else 0}, "
+        f"{1 if v['coarse_push'] else 0})"
         for v in manifest["stage1"]
     )
     stage23 = " ".join(
