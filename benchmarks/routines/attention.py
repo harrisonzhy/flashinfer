@@ -44,6 +44,13 @@ from .flashinfer_benchmark_utils import (
     filter_backends_by_compute_capability,
 )
 
+TRTLLM_RAGGED_ROW_ACTIVITY_MODES = (
+    "assumed_active",
+    "device_check",
+    "cpu_mirror",
+)
+TRTLLM_RAGGED_TIMING_METRIC = "cuda_event_eager_per_call_v1"
+
 
 def normalize_backends(backends):
     """
@@ -70,6 +77,20 @@ def normalize_backends(backends):
         else:
             normalized.append(backend)
     return normalized
+
+
+def _trtllm_ragged_row_activity_kwargs(mode, q_seq_lens_cpu, kv_seq_lens_cpu):
+    """Build row-activity arguments for TRTLLM ragged prefill."""
+    if mode == "assumed_active":
+        return {"skip_all_rows_active_check": True}
+    if mode == "device_check":
+        return {}
+    if mode == "cpu_mirror":
+        return {
+            "q_seq_lens_cpu": q_seq_lens_cpu,
+            "kv_seq_lens_cpu": kv_seq_lens_cpu,
+        }
+    raise ValueError(f"Unsupported TRTLLM ragged row activity mode: {mode}")
 
 
 def _drop_backend(backends, backend, reason):
@@ -425,6 +446,21 @@ def parse_attention_args(line, parser):
         help="Use random actual sequence lengths for the query and key and value. Random values are generated between 1 and maximum sequence length. If False, use maximum sequence length.",
     )
     parser.add_argument(
+        "--row_activity_mode",
+        choices=TRTLLM_RAGGED_ROW_ACTIVITY_MODES,
+        default=None,
+        help=(
+            "TRTLLM native ragged prefill only: choose the all-active fast path, "
+            "device-side row check, or CPU sequence-length mirrors."
+        ),
+    )
+    parser.add_argument(
+        "--calls_per_sample",
+        type=int,
+        default=1,
+        help="TRTLLM native ragged prefill only: calls grouped into each timing sample.",
+    )
+    parser.add_argument(
         "--autotune",
         action="store_true",
         default=False,
@@ -514,6 +550,19 @@ def parse_attention_args(line, parser):
 
     # Normalize backend names (handle deprecated names)
     args.backends = normalize_backends(args.backends)
+    if args.calls_per_sample < 1:
+        raise ValueError("--calls_per_sample must be positive")
+    if args.row_activity_mode is None and args.calls_per_sample != 1:
+        raise ValueError("--calls_per_sample requires --row_activity_mode")
+    if args.row_activity_mode is not None:
+        if args.routine != "BatchPrefillWithRaggedKVCacheWrapper":
+            raise ValueError("--row_activity_mode only supports ragged prefill")
+        if args.backends != ["trtllm-native"]:
+            raise ValueError("--row_activity_mode requires only trtllm-native")
+        if not args.no_cuda_graph or not args.use_cuda_events:
+            raise ValueError(
+                "--row_activity_mode requires --no_cuda_graph and --use_cuda_events"
+            )
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -745,19 +794,19 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 "prims-ts",
                 "requires equal QK/VO head dimensions in {64, 128, 256}",
             )
-        elif page_size not in (16, 32, 64, 128):
+        elif page_size not in (4, 16, 32, 64, 128):
             _drop_backend(
                 backends,
                 "prims-ts",
-                "requires page_size in {16, 32, 64, 128}",
+                "requires page_size in {4, 16, 32, 64, 128}",
             )
         elif num_qo_heads % num_kv_heads != 0 or not (
-            1 <= num_qo_heads // num_kv_heads <= 32
+            1 <= num_qo_heads // num_kv_heads <= 128
         ):
             _drop_backend(
                 backends,
                 "prims-ts",
-                "requires an integral Q/KV head ratio between 1 and 32",
+                "requires an integral Q/KV head ratio between 1 and 128",
             )
         elif q_dtype == torch.bfloat16 and o_data_type != torch.bfloat16:
             _drop_backend(
@@ -1625,7 +1674,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         )
         .long()
         .to(device)
-    )  # For cuDNN
+    )  # Element-unit offsets, for the low-level cudnn-native call only
     qo_indptr = (
         torch.cat(
             [
@@ -1826,7 +1875,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 )
             )
             backend_wrappers["cudnn"].plan(
-                q_indptr,
+                qo_indptr,
                 kv_indptr,
                 kv_indices,
                 kv_last_page_len,
@@ -2325,6 +2374,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     is_cuda_graph_compatible = not args.no_cuda_graph
     # return_lse = not args.no_lse # TO-DO: Add support for this
     run_refcheck = args.refcheck
+    row_activity_mode = args.row_activity_mode or "cpu_mirror"
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
@@ -2434,11 +2484,11 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 "prims-ts",
                 "supports FP16, BF16, and FP8 E4M3 inputs only",
             )
-        elif head_dim_qk != head_dim_vo or head_dim_qk not in (128, 256):
+        elif (head_dim_qk, head_dim_vo) not in ((128, 128), (192, 128), (256, 256)):
             _drop_backend(
                 backends,
                 "prims-ts",
-                "requires equal QK/VO head dimensions in {128, 256}",
+                "requires QK/VO head dimensions (128,128), (192,128), or (256,256)",
             )
         elif num_qo_heads % num_kv_heads != 0:
             _drop_backend(backends, "prims-ts", "requires Hq to be divisible by Hkv")
@@ -2562,7 +2612,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         )
         .long()
         .to(device)
-    )  # For cuDNN
+    )  # Element-unit offsets, for the low-level cudnn-native call only
 
     k_indptr = torch.cat(
         [
@@ -2678,8 +2728,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 )
             )
             backend_wrappers[backend].plan(
-                qo_indptr=q_indptr,
-                kv_indptr=k_indptr,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=num_kv_heads,
                 head_dim_qk=head_dim_qk,
@@ -2693,8 +2743,6 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 seq_lens_q=actual_seq_lens_q_device,
                 max_token_per_sequence=s_qo,
                 max_sequence_kv=s_kv,
-                v_indptr=v_indptr,
-                o_indptr=o_indptr,
             )
 
     q_scale, k_scale, v_scale = None, None, None
@@ -2733,6 +2781,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim_qk,
+            head_dim_vo=head_dim_vo,
             q_dtype=q.dtype,
             kv_dtype=k.dtype,
             packed=True,
@@ -2877,8 +2926,11 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 is_causal=causal,
                 return_lse=True,
                 out=out,
-                q_seq_lens_cpu=actual_seq_lens_q_cpu_flat,
-                kv_seq_lens_cpu=actual_seq_lens_kv_cpu_flat,
+                **_trtllm_ragged_row_activity_kwargs(
+                    row_activity_mode,
+                    actual_seq_lens_q_cpu_flat,
+                    actual_seq_lens_kv_cpu_flat,
+                ),
             )[0]
         elif backend == "trtllm-fmha-v2":
             _q_scale = q_scale if q_scale is not None else 1.0
@@ -2951,26 +3003,29 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 reference_backend = "fa2"
 
         def run_timed_backend(q_arg, k_arg, v_arg, out_arg):
-            return run_backend_wrapper(
-                cur_backend,
-                q_arg,
-                k_arg,
-                v_arg,
-                workspace_buffer,
-                block_tables,
-                actual_seq_lens_q_device,
-                actual_seq_lens_kv_device,
-                q_indptr,
-                k_indptr,
-                v_indptr,
-                o_indptr,
-                batch_offsets_stats,
-                qo_indptr,
-                kv_indptr,
-                out_arg,
-            )
+            result = None
+            for _ in range(args.calls_per_sample):
+                result = run_backend_wrapper(
+                    cur_backend,
+                    q_arg,
+                    k_arg,
+                    v_arg,
+                    workspace_buffer,
+                    block_tables,
+                    actual_seq_lens_q_device,
+                    actual_seq_lens_kv_device,
+                    q_indptr,
+                    k_indptr,
+                    v_indptr,
+                    o_indptr,
+                    batch_offsets_stats,
+                    qo_indptr,
+                    kv_indptr,
+                    out_arg,
+                )
+            return result
 
-        backend_times[cur_backend] = bench_gpu_time(
+        sample_times = bench_gpu_time(
             fn=run_timed_backend,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
@@ -2985,6 +3040,9 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 runtime_out,
             ),
         )
+        backend_times[cur_backend] = [
+            sample_time / args.calls_per_sample for sample_time in sample_times
+        ]
 
     # Perform reference check
     tested_backends = list(outputs.keys())
@@ -3135,6 +3193,10 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 cur_res["avg_actual_seq_len"] = avg_seq_len_q
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
                 cur_res["case_tag"] = args.case_tag
+                if args.row_activity_mode is not None:
+                    cur_res["timing_metric"] = TRTLLM_RAGGED_TIMING_METRIC
+                    cur_res["row_activity_mode"] = args.row_activity_mode
+                    cur_res["calls_per_sample"] = args.calls_per_sample
                 res.append(cur_res)
     return res
 
