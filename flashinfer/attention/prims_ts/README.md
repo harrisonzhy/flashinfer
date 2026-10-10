@@ -14,7 +14,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 
 | Kernel | Guide | Public APIs |
 | --- | --- | --- |
-| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
+| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md), [VC-Attention-QK16](#vc-attention-qk16) below | `BatchPrefillTSWrapper`, `batch_prefill`, `VCAttentionConfig`, `VCAttentionParams`, `VCAttentionPreprocessor`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
 | FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prims_ts_batch_decode_with_kv_cache` |
 | Block-sparse FMHA | — | `BlockSparseTSWrapper`, `block_sparse_attention`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
 | MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_mla_decode_with_paged_kv_cache`, `get_prims_ts_batch_mla_decode_workspace_size`, `prims_ts_batch_mla_decode_with_kv_cache` |
