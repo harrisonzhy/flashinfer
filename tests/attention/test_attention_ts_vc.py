@@ -599,6 +599,57 @@ def test_vc_quantize_fp8_fused_matches_reference(batch, seq_len, heads):
         assert mismatch.item() < 1e-3, name
 
 
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("batch,seq_len,heads", [(1, 2000, 2), (2, 4096, 4)])
+def test_vc_quantize_repair_matches_torch_selection(batch, seq_len, heads):
+    """Whole tiles and the shifted tail hold the input (K) and its per-channel
+    E4M3 (V); the repair tiles hold the tokens of largest residual energy
+    (copied keys, then E4M3 residuals that complement the stored V codes), then
+    zero rows."""
+    _, k, v = _random_inputs(batch, seq_len, heads)
+    budget = 0.02
+    ops = vca.vc_quantize_repair(k, v, budget=budget)
+    selected = max(1, round(budget * seq_len))
+    whole = seq_len // vca.VC_K_BLOCK_SIZE * vca.VC_K_BLOCK_SIZE
+    shift = ops.repair_tiles * vca.VC_K_BLOCK_SIZE
+    vs = (v.float().abs().amax(dim=1) / vca.E4M3_MAX).clamp_min(1e-12)
+    vs_t = vs.unsqueeze(1)
+    v8 = (v.float() / vs_t).to(_FP8)
+    energy = (
+        ((v.float() - v8.float() * vs_t) ** 2).sum(-1).permute(0, 2, 1)
+    )  # [B, H, S]
+    kth = energy.topk(selected, dim=2).values[:, :, -1]
+    torch.testing.assert_close(ops.v_scale, vs, rtol=1e-6, atol=0)
+    for rows, src in ((ops.k, k), (ops.v, v8)):
+        kept = torch.cat([rows[:, :whole], rows[:, whole + shift : seq_len + shift]], 1)
+        # E4M3 rounding ties may differ by one code between the two paths.
+        assert (kept.float() != src.float()).float().mean().item() < 2e-3
+        assert not rows[:, whole + selected : whole + shift].float().any()
+        assert not rows[:, seq_len + shift :].float().any()
+    for b in range(batch):
+        for h in range(heads):
+            # The copied keys identify the selected tokens.
+            match = (
+                k[b, :, h].unsqueeze(0)
+                == ops.k[b, whole : whole + selected, h].unsqueeze(1)
+            ).all(-1)
+            assert (match.sum(1) == 1).all()
+            toks = match.float().argmax(1)
+            assert toks.unique().numel() == selected
+            # Up to fp32 summation order, every selected token is at or above the k-th energy.
+            assert (energy[b, h, toks] >= kth[b, h] * (1 - 1e-4)).all()
+            # Stored code + residual reconstructs the value within the residual's E4M3 half-ulp.
+            x = v[b, toks, h].float() / vs[b, h]
+            stored = (
+                toks + (toks >= whole).int() * shift
+            )  # the tail sits after the repair tiles
+            back = (
+                ops.v[b, stored, h].float()
+                + ops.v[b, whole : whole + selected, h].float()
+            )
+            assert ((back - x).abs() <= 0.5 + 1e-3).all()
+
+
 def test_vc_flat_scale_layout_roundtrip():
     from flashinfer.attention.prims_ts.sage import flat_scale_numel, flat_scale_slot
 
