@@ -11,7 +11,7 @@ once (V twice) and written once:
   the E4M3 V residuals and the packed bf16 tile-mean UMMA operand;
 * :class:`VcQKPass` (VC-Attention-QK8 only): per 128-token block, the
   Hadamard-rotated E4M3 Q, and the permuted, centred, rotated E4M3 K, with one
-  scale per block in the sage flat scale layout.
+  scale per block in the ``[H, B, blocks]`` scale tables.
 
 With ``repair`` the token order is the input order, the partial last tile
 moves ``tail_shift`` rows down to leave room for the V repair tiles, and pass
@@ -118,17 +118,16 @@ def _block_max(v: Float32, red_smem, tidx: Int32) -> Float32:
 
 
 @cute.jit
-def _flat_scale_offset(
+def _scale_offset(
     bh: Int32, num_heads: Int32, num_batch_heads: Int32, seq_len: Int32, block: Int32
 ) -> Int64:
-    """Element offset of block ``block`` of sequence ``bh // num_heads`` in the flat
-    ``[H, ceil(B*S / 128) + B - 1]`` scale layout (``sage.flat_scale_slot``)."""
-    b_idx = bh // num_heads
-    h_idx = bh % num_heads
+    """Element offset of block ``block`` of sequence ``bh // num_heads`` in the
+    ``[H, B, blocks]`` scale table."""
+    n_blocks = (seq_len + _TILE - 1) // _TILE
     n_batch = num_batch_heads // num_heads
-    numel = ((n_batch * seq_len + _TILE - 1) // _TILE) + n_batch - 1
-    slot = ((b_idx * seq_len) // _TILE) + b_idx + block
-    return Int64(h_idx) * Int64(numel) + Int64(slot)
+    return Int64(bh % num_heads) * Int64(n_batch * n_blocks) + Int64(
+        (bh // num_heads) * n_blocks + block
+    )
 
 
 @cute.jit
@@ -587,7 +586,7 @@ class VcKvPass2:
 class VcQKPass:
     """VC-Attention-QK8 Q or K pass: per (batch*head, 128-token block), quantize
     a ``[B, S, H, D]`` bf16/fp16 tensor to E4M3 after the Hadamard rotation,
-    one scale per block in the flat scale layout. ``gather`` reads the rows
+    one scale per block in the ``[H, B, blocks]`` scale table. ``gather`` reads the rows
     through a row map (the K/V permutation; under V repair the whole tiles,
     the repair tiles' selected tokens and the shifted tail, with ``-1`` for
     zero rows) and ``centre`` subtracts the per-head channel mean first (both
@@ -682,7 +681,7 @@ class VcQKPass:
         if tidx == 0:
             cutlass.inttoptr(
                 mScale.iterator.toint()
-                + _flat_scale_offset(bh, num_heads, num_batch_heads, seq_len, nb) * 4,
+                + _scale_offset(bh, num_heads, num_batch_heads, seq_len, nb) * 4,
                 mem_space=1,
                 dtype=Float32,
             ).store(scale)
@@ -868,8 +867,8 @@ def vc_prepare_fp8(
     ``q``, ``k``, ``v``: contiguous ``[B, S, H, D]`` bf16/fp16 (one Q block scale
     per 128 tokens); ``perm``: ``[B, H, S_k]`` int32/int64. Returns ``(q8, k8,
     v8, q_scale, k_scale, v_scale, mean, mu, energy)`` in the
-    ``VCAttentionOperands`` layouts, the Q/K scales in the flat scale layout
-    (the K layout over the K/V rows, repair tiles included). With
+    ``VCAttentionOperands`` layouts, the Q/K scales as ``[H, B, blocks]`` tables
+    (the K table over the K/V rows, repair tiles included). With
     ``repair_tiles`` the K repair tiles are left unwritten for
     :func:`vc_prepare_repair_keys_fp8`.
     """
@@ -968,11 +967,8 @@ def _prepare(
         # bf16/fp16 input, fp32 accumulation; no fp32 copy of K.
         k_mean = k.mean(dim=1, dtype=torch.float32).contiguous()  # [B, H, D]
         k8 = torch.empty((b, rows, h, d), dtype=torch.float8_e4m3fn, device=dev)
-        # Flat scale layout (sage.flat_scale_numel), [H, ceil(B*S / 128) + B - 1].
-        k_scale = torch.ones(
-            (h, (b * rows + _TILE - 1) // _TILE + b - 1),
-            dtype=torch.float32,
-            device=dev,
+        k_scale = torch.empty(
+            (h, b, (rows + _TILE - 1) // _TILE), dtype=torch.float32, device=dev
         )
         k_rows = _repair_row_map(b, h, s_k, repair_tiles, dev) if repair else perm32
     else:
@@ -1034,8 +1030,8 @@ def _prepare(
         return k_perm, v8, v_scale, mean, mu, energy, None, None, None
     s_q = q.shape[1]
     q8 = torch.empty((b, s_q, h, d), dtype=torch.float8_e4m3fn, device=dev)
-    q_scale = torch.ones(
-        (h, (b * s_q + _TILE - 1) // _TILE + b - 1), dtype=torch.float32, device=dev
+    q_scale = torch.empty(
+        (h, b, (s_q + _TILE - 1) // _TILE), dtype=torch.float32, device=dev
     )
     pk(
         k.view(-1),
