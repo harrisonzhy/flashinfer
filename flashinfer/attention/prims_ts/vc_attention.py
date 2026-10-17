@@ -55,6 +55,7 @@ from __future__ import annotations
 import functools
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -315,6 +316,9 @@ class VCAttentionOperands:
     q_scale: torch.Tensor | None = None  # [H, flat_scale_numel(B, S_q, q_block)] fp32
     k_scale: torch.Tensor | None = None  # [H, flat_scale_numel(B, S_k, 128)] fp32
     q_block_size: int = VC_K_BLOCK_SIZE
+    # [B, H, 2, D] fp32 channel statistics of this call, the K sums and the V
+    # residual amax. The next call can take them as its previous statistics.
+    stats: torch.Tensor | None = None
 
     @property
     def params(self) -> "VCAttentionParams":
@@ -524,18 +528,20 @@ def vc_quantize(
     kmeans_iters: int = VC_KMEANS_ITERS,
     generator: torch.Generator | None = None,
     demean: bool = True,
+    prev_stats: torch.Tensor | None = None,
 ) -> VCAttentionOperands:
     """Turn ``[B, S, H, D]`` bf16/fp16 K/V into VC-Attention-QK16 kernel
-    operands with two CuTe DSL kernels (``kernels/vc_prepare.py``).
+    operands with the CuTe DSL kernels of ``kernels/vc_prepare.py``.
 
     Keys are permuted with the values and kept in their dtype. Values are
     permuted, split into 128-token tile means and residuals (``demean=False``
     keeps the means at zero), and the residuals are quantized to E4M3 with one
     scale per (batch, head, channel), returned as ``v_scale`` for the run's
-    ``vc`` operands. Pass 1 gathers each permuted tile once, writes the
-    permuted K rows, the V tile mean and residual amax; pass 2 writes the E4M3
-    residuals and the packed bf16 mean operand. Requires CUDA bf16/fp16 inputs
-    with head_dim 128.
+    ``vc`` operands. The scale needs the residual amax of the whole sequence,
+    so without ``prev_stats`` the pass over K and V runs twice. With the
+    ``stats`` of a previous call as ``prev_stats`` the scale comes from them
+    and one pass writes everything. Requires CUDA bf16/fp16 inputs with
+    head_dim 128.
     """
     if k.dim() != 4 or k.shape != v.shape or k.dtype != v.dtype:
         raise ValueError("k and v must be [B, S, H, D] with matching shapes and dtype")
@@ -544,11 +550,12 @@ def vc_quantize(
 
     if perm is None:
         perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)
-    k_p, v8, v_scale, mean, mu = vc_prepare(
+    k_p, v8, v_scale, mean, mu, stats = vc_prepare(
         k.contiguous(),
         v.contiguous(),
         perm,
         demean=demean,
+        prev_stats=prev_stats,
     )
     return VCAttentionOperands(
         k=k_p,
@@ -558,6 +565,7 @@ def vc_quantize(
         mu=mu,
         perm=perm,
         demean=demean,
+        stats=stats,
     )
 
 
@@ -572,17 +580,23 @@ def vc_quantize_fp8(
     kmeans_iters: int = VC_KMEANS_ITERS,
     generator: torch.Generator | None = None,
     demean: bool = True,
+    prev_stats: torch.Tensor | None = None,
 ) -> VCAttentionOperands:
     """Turn ``[B, S, H, D]`` bf16/fp16 Q/K/V into VC-Attention-QK8 kernel
-    operands with four CuTe DSL kernels (``kernels/vc_prepare.py``).
+    operands with the CuTe DSL kernels of ``kernels/vc_prepare.py``.
 
-    Keys are centred by their per-(batch, head) channel mean over tokens
+    Keys are centered by their per-(batch, head) channel mean over tokens
     (softmax-invariant), permuted with the values, rotated with Q by the
     normalised Hadamard matrix and quantized to E4M3 with one scale per
     128-token tile; queries take one E4M3 scale per 128-token block
     (``q_block_size`` must be 128 here; the kernel itself accepts any power
-    of two in [1, 256] through ``VCAttentionConfig``). Values are prepared as
-    in ``vc_quantize``. Requires CUDA bf16/fp16 inputs with head_dim 128.
+    of two in [1, 256] through ``VCAttentionConfig``). Values are permuted,
+    split into 128-token tile means and E4M3 residuals with one scale per
+    batch, head and channel. The scale and the K centre need whole-sequence
+    statistics, so without ``prev_stats`` the passes over K and V run twice.
+    With the ``stats`` of a previous call as ``prev_stats`` they come from
+    them and each pass runs once. Requires CUDA bf16/fp16 inputs with
+    head_dim 128.
     """
     if (
         q.dim() != 4
@@ -605,8 +619,13 @@ def vc_quantize_fp8(
 
     if perm is None:
         perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)
-    q8, k8, v8, q_scale, k_scale, v_scale, mean, mu = vc_prepare_fp8(
-        q.contiguous(), k.contiguous(), v.contiguous(), perm, demean=demean
+    q8, k8, v8, q_scale, k_scale, v_scale, mean, mu, stats = vc_prepare_fp8(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        perm,
+        demean=demean,
+        prev_stats=prev_stats,
     )
     return VCAttentionOperands(
         k=k8,
@@ -620,6 +639,7 @@ def vc_quantize_fp8(
         q_scale=q_scale,
         k_scale=k_scale,
         q_block_size=q_block_size,
+        stats=stats,
     )
 
 
@@ -630,6 +650,7 @@ def vc_quantize_repair(
     *,
     budget: float,
     q: torch.Tensor | None = None,
+    prev_stats: torch.Tensor | None = None,
 ) -> VCAttentionOperands:
     """Turn ``[B, S, H, D]`` K/V into V repair operands, of VC-Attention-QK8
     with ``q``.
@@ -638,7 +659,10 @@ def vc_quantize_repair(
     head and channel. The ``budget`` fraction of tokens with the largest
     residual energy per batch and head gets a repair row, a copy of the key
     (under QK8 re-centred, rotated and quantized with the repair tile's own
-    scale) with the E4M3 residual of the value.
+    scale) with the E4M3 residual of the value. The scale and the QK8 K
+    centre need whole-sequence statistics, so without ``prev_stats`` the
+    passes over K and V run twice. With the ``stats`` of a previous call as
+    ``prev_stats`` they come from them and each pass runs once.
     """
     if k.dim() != 4 or k.shape != v.shape or k.dtype != v.dtype:
         raise ValueError("k and v must be [B, S, H, D] with matching shapes and dtype")
@@ -657,12 +681,13 @@ def vc_quantize_repair(
     s_k = k.shape[1]
     repair_tiles = vc_repair_tiles(s_k, budget)
     selected = max(1, round(budget * s_k))
-    q8, k_all, v_all, q_scale, k_scale, v_scale = vc_prepare_repair(
+    q8, k_all, v_all, q_scale, k_scale, v_scale, stats = vc_prepare_repair(
         None if q is None else q.contiguous(),
         k.contiguous(),
         v.contiguous(),
         repair_tiles=repair_tiles,
         selected=selected,
+        prev_stats=prev_stats,
     )
     return VCAttentionOperands(
         k=k_all,
@@ -677,6 +702,7 @@ def vc_quantize_repair(
         q=q8,
         q_scale=q_scale,
         k_scale=k_scale,
+        stats=stats,
     )
 
 
@@ -691,6 +717,12 @@ class VCAttentionPreprocessor:
     ``kmeans_iters`` parametrize the online k-means. Without a denoise step
     the grouping is computed once per K/V geometry and kept. With ``q`` the
     preparation is the VC-Attention-QK8 one (one E4M3 Q scale per 128 tokens).
+
+    Each step's channel statistics feed the next, so K and V are read once
+    per step. The V scale is the running residual amax of the window and the
+    K centre the previous step's channel sums. Step 0, a regrouping and the
+    end of the V-Smooth window restart them with the exact two-pass
+    preparation.
     """
 
     def __init__(
@@ -713,8 +745,9 @@ class VCAttentionPreprocessor:
         self.perm_refresh_every = perm_refresh_every
         self.kmeans_clusters = kmeans_clusters
         self.kmeans_iters = kmeans_iters
-        # Per (batch, seq_len_k, num_kv_heads): perm, centroids, step of the last refresh.
-        self._groupings: dict[tuple[int, int, int], dict[str, object]] = {}
+        # Per (batch, seq_len_k, num_kv_heads): perm, centroids, step of the last
+        # refresh, the channel statistics and the demean state they belong to.
+        self._groupings: dict[tuple[int, int, int], dict[str, Any]] = {}
 
     @torch.no_grad()
     @torch.compiler.disable
@@ -761,6 +794,8 @@ class VCAttentionPreprocessor:
                     "perm": perm.to(torch.int32),
                     "centroids": centroids,
                     "step": None if denoise_step is None else denoise_step[0],
+                    "stats": None,
+                    "demean": smooth,
                 }
                 self._groupings[key] = entry
             perm = entry["perm"]
@@ -771,9 +806,24 @@ class VCAttentionPreprocessor:
         else:
             perm = torch.arange(k.shape[1], device=k.device, dtype=torch.int32)
             perm = perm.view(1, 1, -1).expand(k.shape[0], k.shape[2], -1).contiguous()
+        prev_stats = None
+        if entry is not None and entry["demean"] == smooth:
+            prev_stats = entry["stats"]
         if q is not None:
-            return vc_quantize_fp8(q, k, v, perm=perm, demean=smooth)
-        return vc_quantize(k, v, perm=perm, demean=smooth)
+            ops = vc_quantize_fp8(
+                q, k, v, perm=perm, demean=smooth, prev_stats=prev_stats
+            )
+        else:
+            ops = vc_quantize(k, v, perm=perm, demean=smooth, prev_stats=prev_stats)
+        if entry is not None:
+            stats = ops.stats
+            if prev_stats is not None:
+                # The V amax keeps the running maximum so the scale never shrinks.
+                stats = stats.clone()
+                stats[:, :, 1] = torch.maximum(stats[:, :, 1], prev_stats[:, :, 1])
+            entry["stats"] = stats
+            entry["demean"] = smooth
+        return ops
 
 
 @torch.no_grad()

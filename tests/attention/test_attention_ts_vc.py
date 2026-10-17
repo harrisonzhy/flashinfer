@@ -650,6 +650,35 @@ def test_vc_quantize_repair_matches_torch_selection(batch, seq_len, heads):
             assert ((back - x).abs() <= 0.5 + 1e-3).all()
 
 
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("qk8", [False, True], ids=["qk16", "qk8"])
+def test_vc_quantize_previous_stats_matches_two_pass(qk8):
+    """Given its own statistics as the previous ones, the one-pass preparation
+    reproduces the two-pass operands up to E4M3 rounding ties, and the fresh
+    statistics equal the exact ones."""
+    q, k, v = _random_inputs(2, 2000, 2)
+    perm = vca.vc_token_permutation(v)
+    if qk8:
+        exact = vca.vc_quantize_fp8(q, k, v, perm=perm)
+        fused = vca.vc_quantize_fp8(q, k, v, perm=perm, prev_stats=exact.stats)
+        assert torch.equal(fused.q, exact.q)
+        torch.testing.assert_close(fused.k_scale, exact.k_scale, rtol=1e-6, atol=0)
+    else:
+        exact = vca.vc_quantize(k, v, perm=perm)
+        fused = vca.vc_quantize(k, v, perm=perm, prev_stats=exact.stats)
+    torch.testing.assert_close(fused.v_scale, exact.v_scale, rtol=0, atol=0)
+    torch.testing.assert_close(fused.mean, exact.mean, rtol=0, atol=0)
+    assert torch.equal(fused.mu, exact.mu)
+    for name in ("k", "v"):
+        mismatch = (
+            (getattr(fused, name).float() != getattr(exact, name).float())
+            .float()
+            .mean()
+        )
+        assert mismatch.item() < 1e-3, name
+    torch.testing.assert_close(fused.stats, exact.stats, rtol=1e-5, atol=1e-6)
+
+
 def test_vc_flat_scale_layout_roundtrip():
     from flashinfer.attention.prims_ts.sage import flat_scale_numel, flat_scale_slot
 
