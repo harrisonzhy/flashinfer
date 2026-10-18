@@ -457,7 +457,6 @@ inputs with `head_dim=128`).
 | Q/K dtype | `torch.bfloat16`, `torch.float16` (QK16) or `torch.float8_e4m3fn` (QK8) |
 | V dtype | `torch.float8_e4m3fn` |
 | Output dtype | `torch.bfloat16` or `torch.float16` |
-| `q_block_size` | Power of two in [1, 256]; default 128 (QK8 Q scale block) |
 | Geometry | `head_dim=128`, `num_qo_heads == num_kv_heads`, `packed=False`, `mask_type="dense"`; QK16 runs the two-CTA UMMA form, QK8 follows the device default |
 
 ### Operand tensors
@@ -468,14 +467,15 @@ the preparation writes; both are contiguous and 16-byte aligned on the run
 device, and a validating `run()` checks them against the plan. The plan's
 `VCAttentionConfig` sets `demean`. It is off after the V-Smooth window, when
 the means are zero, so a caller holds one plan of each kind and picks by
-`ops.demean`. QK8 plans add `q_scale` `[Hq, flat_scale_numel(B, Sq, q_block_size)]`
-and `k_scale` `[Hkv, flat_scale_numel(B, Skv_rows, 128)]`, fp32 in the flat scale
-layout of `flashinfer.attention.prims_ts.sage` (`flat_block_scales` packs them;
-`Skv_rows` includes the repair tiles). `VCAttentionPreprocessor.prepare`,
-`vc_quantize` and `vc_quantize_fp8` return everything with the permuted K and the
-E4M3 V (and Q) as `VCAttentionOperands`, whose `.params` is the run-time object.
-`vc_quantize_repair` builds the V repair operands of either recipe instead and
-their plan has demean off and a positive `repair_tiles`.
+`ops.demean`. QK8 plans add `q_scale` `[Hq, B, ceil(Sq / 128)]` and `k_scale`
+`[Hkv, B, ceil(Skv_rows / 128)]`, fp32 with one scale per 128-token block, where
+`Skv_rows` includes the repair tiles. `vc_quantize` and `vc_quantize_fp8` run the
+CuTe DSL preparation kernels and return everything with the permuted K and the
+E4M3 V, and Q under QK8, as `VCAttentionOperands`, whose `.params` is the run-time
+object. `VCAttentionPreprocessor.prepare` drives them with the V-Smooth schedule,
+and `vc_reference` is the torch reference over those operands. `vc_quantize_repair`
+builds the V repair operands of either recipe instead and their plan has demean
+off and a positive `repair_tiles`.
 
 ### Example
 
@@ -497,17 +497,19 @@ prep = VCAttentionPreprocessor()
 ops = prep.prepare(k_bf16, v_bf16, denoise_step=(step, num_steps))
 out = wrappers[ops.demean].run(q_bf16, ops.k, ops.v, vc=ops.params)
 
-# VC-Attention-QK8 plans E4M3 Q/K and passes Q to the preprocessor. It needs
-# one plan per demean phase in the same way.
-wrapper8 = BatchPrefillTSWrapper()
-wrapper8.plan(
-    device="cuda", batch_size=1, max_seq_len_q=S, max_kv_len=S,
-    num_qo_heads=H, num_kv_heads=H, head_dim=128,
-    q_dtype=torch.float8_e4m3fn, k_dtype=torch.float8_e4m3fn, v_dtype=torch.float8_e4m3fn,
-    out_dtype=torch.bfloat16, vc_config=VCAttentionConfig(q_block_size=128),
-)
+# VC-Attention-QK8 plans E4M3 Q/K and passes Q to the preprocessor, again with
+# one plan per demean phase.
+wrappers8 = {}
+for demean in (True, False):
+    wrappers8[demean] = BatchPrefillTSWrapper()
+    wrappers8[demean].plan(
+        device="cuda", batch_size=1, max_seq_len_q=S, max_kv_len=S,
+        num_qo_heads=H, num_kv_heads=H, head_dim=128,
+        q_dtype=torch.float8_e4m3fn, k_dtype=torch.float8_e4m3fn, v_dtype=torch.float8_e4m3fn,
+        out_dtype=torch.bfloat16, vc_config=VCAttentionConfig(demean=demean),
+    )
 ops8 = prep.prepare(k_bf16, v_bf16, q=q_bf16, denoise_step=(step, num_steps))
-out8 = wrapper8.run(ops8.q, ops8.k, ops8.v, vc=ops8.params)
+out8 = wrappers8[ops8.demean].run(ops8.q, ops8.k, ops8.v, vc=ops8.params)
 ```
 
 The one-shot `batch_prefill(..., vc=ops.params)` plans the recipe from the

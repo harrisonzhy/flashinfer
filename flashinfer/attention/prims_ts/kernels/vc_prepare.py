@@ -1133,6 +1133,10 @@ def _prepare(q, k, v, perm, *, demean: bool, repair_tiles: int, selected: int):
     rows = vc_repair_kv_len(s_k, repair_tiles) if repair else s_k
     s_q = 0 if q is None else q.shape[1]
     ker = _compiled(k.dtype, bool(demean), b, s_k, h, repair_tiles, s_q, selected)
+    if not repair and (
+        perm is None or tuple(perm.shape) != (b, h, s_k) or perm.device != dev
+    ):
+        raise ValueError(f"perm must be a [B, H, S_k] index tensor on {dev}")
     perm32 = None if repair else perm.to(torch.int32).contiguous()
     stats = torch.zeros((b, h, 2, d), dtype=torch.float32, device=dev)
     mean = torch.empty((b, h, t, d), dtype=torch.float32, device=dev)
