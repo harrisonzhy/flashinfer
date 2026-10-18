@@ -136,8 +136,8 @@ def _load_row_f32(addr: Int64):
 
 
 @cute.jit
-def _store_row_fp8(addr: Int64, vals, base: cutlass.Constexpr[int], scale_inv: Float32):
-    """Quantize this thread's 8 values by ``scale_inv`` and store 8 E4M3 bytes."""
+def _pack_row_fp8(vals, base: cutlass.Constexpr[int], scale_inv: Float32):
+    """This thread's 8 values from ``base`` times ``scale_inv`` as two E4M3 words."""
     packed = cutlass.Array(Int32, _COLS // 4, space=cutlass.AddressSpace.rmem)
     for j in cutlass.range_constexpr(_COLS // 4):
         packed[j] = _pack_float4_to_fp8_e4m3(
@@ -146,9 +146,39 @@ def _store_row_fp8(addr: Int64, vals, base: cutlass.Constexpr[int], scale_inv: F
             vals[base + 4 * j + 2] * scale_inv,
             vals[base + 4 * j + 3] * scale_inv,
         )
-    cutlass.inttoptr(addr, mem_space=1, dtype=Int32).store(
-        packed.data_ptr().load(count=_COLS // 4, alignment=8), alignment=8
-    )
+    return packed.data_ptr().load(count=_COLS // 4, alignment=8)
+
+
+@cute.jit
+def _coords(H: cutlass.Constexpr[int]):
+    """This CTA's tile, batch and head, this thread's row group and first column."""
+    tidx, _, _ = cute.arch.thread_idx()
+    t, bh, _ = cute.arch.block_idx()
+    return t, bh, bh // H, bh % H, tidx // _COL_GROUPS, (tidx % _COL_GROUPS) * _COLS
+
+
+@cute.jit
+def _row_base(
+    base: Int64,
+    b: Int32,
+    rows: cutlass.Constexpr[int],
+    h: Int32,
+    col0: Int32,
+    elem_bytes: cutlass.Constexpr[int],
+    row_bytes: cutlass.Constexpr[int],
+) -> Int64:
+    """Address of this thread's columns of row 0 of batch ``b`` in a ``[B, rows, H, D]`` tensor."""
+    return base + Int64(b) * rows * row_bytes + (Int64(h) * _D + col0) * elem_bytes
+
+
+@cute.jit
+def _store_tile_cols(
+    base: Int64, bh: Int32, T: cutlass.Constexpr[int], t: Int32, col0: Int32, vals
+):
+    """Store this thread's 8 columns of tile ``t`` of a ``[B, H, T, D]`` fp32 tensor."""
+    cutlass.inttoptr(
+        base + ((Int64(bh) * T + t) * _D + col0) * 4, mem_space=1, dtype=Float32
+    ).store(vals.data_ptr().load(count=_COLS, alignment=32), alignment=32)
 
 
 @cute.jit
@@ -230,25 +260,15 @@ class VcKvPass1(_Shape):
         mKSum: cute.Tensor | None,
         mStats: cute.Tensor,
     ):
-        tidx, _, _ = cute.arch.thread_idx()
-        t, bh, _ = cute.arch.block_idx()
-        b = bh // self.H
-        h = bh % self.H
-        cg = tidx % _COL_GROUPS
-        rg = tidx // _COL_GROUPS
-        col0 = cg * _COLS
+        t, bh, b, h, rg, col0 = _coords(self.H)
         smem = cutlass.utils.SmemAllocator()
         col_sums = smem.allocate_array(Float32, _ROW_GROUPS * _TILE)
-        k_base = (
-            mK.iterator.toint()
-            + Int64(b) * self.S * self.row_bytes
-            + (Int64(h) * _D + col0) * 2
-        )
-        v_base = (
-            mV.iterator.toint()
-            + Int64(b) * self.S * self.row_bytes
-            + (Int64(h) * _D + col0) * 2
-        )
+        k_base = _row_base(mK.iterator.toint(), b, self.S, h, col0, 2, self.row_bytes)
+        v_base = _row_base(mV.iterator.toint(), b, self.S, h, col0, 2, self.row_bytes)
+        if cutlass.const_expr(mKPerm is not None):
+            kp_base = _row_base(
+                mKPerm.iterator.toint(), b, self.rows, h, col0, 2, self.row_bytes
+            )
 
         # Rows past the sequence read token 0 and skip the math, so every load
         # of a thread is in flight together.
@@ -275,11 +295,7 @@ class VcKvPass1(_Shape):
                 if pos < self.S:
                     out_row = pos + self.shift * Int32(pos >= self.tail)
                     cutlass.inttoptr(
-                        mKPerm.iterator.toint()
-                        + (Int64(b) * self.rows + out_row) * self.row_bytes
-                        + (Int64(h) * _D + col0) * 2,
-                        mem_space=1,
-                        dtype=Int32,
+                        kp_base + out_row * self.row_bytes, mem_space=1, dtype=Int32
                     ).store(
                         (raw.data_ptr() + i * _WORDS).load(count=_WORDS, alignment=16),
                         alignment=16,
@@ -304,11 +320,7 @@ class VcKvPass1(_Shape):
                         ksum[j] = ksum[j] + row[j]
             _cta_col_reduce(col_sums, ksum, rg, col0, False)
             if rg == 0:
-                cutlass.inttoptr(
-                    mKSum.iterator.toint() + ((Int64(bh) * self.T + t) * _D + col0) * 4,
-                    mem_space=1,
-                    dtype=Float32,
-                ).store(ksum.data_ptr().load(count=_COLS, alignment=32), alignment=32)
+                _store_tile_cols(mKSum.iterator.toint(), bh, self.T, t, col0, ksum)
 
         # Per-column sum, max and min of the tile's V rows give the mean and the
         # residual amax exactly.
@@ -340,11 +352,7 @@ class VcKvPass1(_Shape):
             if cutlass.const_expr(not self.demean):
                 mean[j] = Float32(0.0)
         if rg == 0:
-            cutlass.inttoptr(
-                mMean.iterator.toint() + ((Int64(bh) * self.T + t) * _D + col0) * 4,
-                mem_space=1,
-                dtype=Float32,
-            ).store(mean.data_ptr().load(count=_COLS, alignment=32), alignment=32)
+            _store_tile_cols(mMean.iterator.toint(), bh, self.T, t, col0, mean)
         cmax = cutlass.Array(Float32, _COLS, space=cutlass.AddressSpace.rmem)
         for j in cutlass.range_constexpr(_COLS):
             cmax[j] = Float32(0.0)
@@ -465,14 +473,7 @@ class VcKvPass2(_Shape):
                 if cutlass.const_expr(mEnergy is not None):
                     # The squared E4M3 rounding error in value units ranks the
                     # tokens for repair.
-                    packed = cutlass.Array(
-                        Int32, _COLS // 4, space=cutlass.AddressSpace.rmem
-                    )
-                    for j in cutlass.range_constexpr(_COLS // 4):
-                        packed[j] = _pack_float4_to_fp8_e4m3(
-                            res[4 * j], res[4 * j + 1], res[4 * j + 2], res[4 * j + 3]
-                        )
-                    words = packed.data_ptr().load(count=_COLS // 4, alignment=8)
+                    words = _pack_row_fp8(res, 0, Float32(1.0))
                     codes = words.bitcast(cutlass.Float8E4M3FN).to(Float32)
                     for c in cutlass.range_constexpr(_COLS):
                         err = (res[c] - codes[c]) * vs[c]
@@ -481,7 +482,9 @@ class VcKvPass2(_Shape):
                         words, alignment=8
                     )
                 else:
-                    _store_row_fp8(out_addr, res, 0, Float32(1.0))
+                    cutlass.inttoptr(out_addr, mem_space=1, dtype=Int32).store(
+                        _pack_row_fp8(res, 0, Float32(1.0)), alignment=8
+                    )
             if cutlass.const_expr(mEnergy is not None):
                 energy_part[(rg + _ROW_GROUPS * i) * _COL_GROUPS + cg] = energy
         if cutlass.const_expr(mEnergy is not None):
@@ -611,21 +614,13 @@ class VcQKPass(_Shape):
         mX8: cute.Tensor,
         mScale: cute.Tensor,
     ):
-        tidx, _, _ = cute.arch.thread_idx()
-        nb, bh, _ = cute.arch.block_idx()
+        nb, bh, b, h, rg, col0 = _coords(self.H)
         nb = nb + self.block0
-        b = bh // self.H
-        h = bh % self.H
-        cg = tidx % _COL_GROUPS
-        rg = tidx // _COL_GROUPS
-        col0 = cg * _COLS
+        cg = col0 // _COLS
+        tidx = rg * _COL_GROUPS + cg
         smem = cutlass.utils.SmemAllocator()
         red = smem.allocate_array(Float32, _THREADS // 32)
-        x_base = (
-            mX.iterator.toint()
-            + Int64(b) * self.src * self.row_bytes
-            + (Int64(h) * _D + col0) * 2
-        )
+        x_base = _row_base(mX.iterator.toint(), b, self.src, h, col0, 2, self.row_bytes)
         centre = cutlass.Array(Float32, _COLS, space=cutlass.AddressSpace.rmem)
         for j in cutlass.range_constexpr(_COLS):
             centre[j] = Float32(0.0)
@@ -701,18 +696,15 @@ class VcQKPass(_Shape):
                 dtype=Float32,
             ).store(scale)
         scale_inv = Float32(_HADAMARD_NORM) / scale
-        x8_base = (
-            mX8.iterator.toint()
-            + Int64(b) * self.rows_out * self.row_bytes8
-            + Int64(h) * _D
-            + col0
+        x8_base = _row_base(
+            mX8.iterator.toint(), b, self.rows_out, h, col0, 1, self.row_bytes8
         )
         for i in cutlass.range_constexpr(_ROWS):
             pos = nb * _TILE + rg + _ROW_GROUPS * i
             if pos < self.rows_out:
-                _store_row_fp8(
-                    x8_base + Int64(pos) * self.row_bytes8, vals, i * _COLS, scale_inv
-                )
+                cutlass.inttoptr(
+                    x8_base + Int64(pos) * self.row_bytes8, mem_space=1, dtype=Int32
+                ).store(_pack_row_fp8(vals, i * _COLS, scale_inv), alignment=8)
 
     @cute.jit
     def __call__(self, mX, mPerm, mIndex, mStats, mX8, mScale, stream):
@@ -872,13 +864,18 @@ class VcRepairRowsPass(_Shape):
         mKOut: cute.Tensor | None,
         mV8: cute.Tensor,
     ):
-        tidx, _, _ = cute.arch.thread_idx()
-        j, bh, _ = cute.arch.block_idx()
-        b = bh // self.H
-        h = bh % self.H
-        cg = tidx % _COL_GROUPS
-        rg = tidx // _COL_GROUPS
-        col0 = cg * _COLS
+        j, bh, b, h, rg, col0 = _coords(self.H)
+        v_base = _row_base(mV.iterator.toint(), b, self.S, h, col0, 2, self.row_bytes)
+        v8_base = _row_base(
+            mV8.iterator.toint(), b, self.rows, h, col0, 1, self.row_bytes8
+        )
+        if cutlass.const_expr(mKOut is not None):
+            k_base = _row_base(
+                mK.iterator.toint(), b, self.S, h, col0, 2, self.row_bytes
+            )
+            kout_base = _row_base(
+                mKOut.iterator.toint(), b, self.rows, h, col0, 2, self.row_bytes
+            )
         vmax = _load_row_f32(_stats_addr(mStats, bh, 1, col0))
         vs_inv = cutlass.Array(Float32, _COLS, space=cutlass.AddressSpace.rmem)
         for c in cutlass.range_constexpr(_COLS):
@@ -901,45 +898,29 @@ class VcRepairRowsPass(_Shape):
                         dtype=Int32,
                     ).load()
             if out_row < self.rows:
-                row_off = Int64(b) * self.rows + out_row
-                v_dst = (
-                    mV8.iterator.toint()
-                    + row_off * self.row_bytes8
-                    + Int64(h) * _D
-                    + col0
-                )
+                v_dst = v8_base + out_row * self.row_bytes8
                 if tok >= 0:
-                    src_off = (Int64(b) * self.S + tok) * self.row_bytes + (
-                        Int64(h) * _D + col0
-                    ) * 2
-                    _load_raw(raw, 0, mV.iterator.toint() + src_off)
+                    src_off = Int64(tok) * self.row_bytes
+                    _load_raw(raw, 0, v_base + src_off)
                     row = _row(raw, 0, self.is_bf16)
                     # The residual of the E4M3 code pass 2 stored for this token.
                     res = cutlass.Array(Float32, _COLS, space=cutlass.AddressSpace.rmem)
                     for c in cutlass.range_constexpr(_COLS):
                         res[c] = row[c] * vs_inv[c]
-                    packed = cutlass.Array(
-                        Int32, _COLS // 4, space=cutlass.AddressSpace.rmem
-                    )
-                    for c in cutlass.range_constexpr(_COLS // 4):
-                        packed[c] = _pack_float4_to_fp8_e4m3(
-                            res[4 * c], res[4 * c + 1], res[4 * c + 2], res[4 * c + 3]
-                        )
                     codes = (
-                        packed.data_ptr()
-                        .load(count=_COLS // 4, alignment=8)
+                        _pack_row_fp8(res, 0, Float32(1.0))
                         .bitcast(cutlass.Float8E4M3FN)
                         .to(Float32)
                     )
                     for c in cutlass.range_constexpr(_COLS):
                         res[c] = res[c] - codes[c]
-                    _store_row_fp8(v_dst, res, 0, Float32(1.0))
+                    cutlass.inttoptr(v_dst, mem_space=1, dtype=Int32).store(
+                        _pack_row_fp8(res, 0, Float32(1.0)), alignment=8
+                    )
                     if cutlass.const_expr(mKOut is not None):
-                        _load_raw(raw, 0, mK.iterator.toint() + src_off)
+                        _load_raw(raw, 0, k_base + src_off)
                         cutlass.inttoptr(
-                            mKOut.iterator.toint()
-                            + row_off * self.row_bytes
-                            + (Int64(h) * _D + col0) * 2,
+                            kout_base + out_row * self.row_bytes,
                             mem_space=1,
                             dtype=Int32,
                         ).store(
@@ -952,9 +933,7 @@ class VcRepairRowsPass(_Shape):
                     )
                     if cutlass.const_expr(mKOut is not None):
                         cutlass.inttoptr(
-                            mKOut.iterator.toint()
-                            + row_off * self.row_bytes
-                            + (Int64(h) * _D + col0) * 2,
+                            kout_base + out_row * self.row_bytes,
                             mem_space=1,
                             dtype=Int32,
                         ).store(
