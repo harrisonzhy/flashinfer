@@ -951,6 +951,10 @@ def _prepare(
     tail_start = s_k // _TILE * _TILE if repair else s_k
     qk_fp8 = q is not None
     p1, p2, pq, pk = _compiled(k.dtype, bool(demean), repair, qk_fp8)
+    if not repair and (
+        perm is None or tuple(perm.shape) != (b, h, s_k) or perm.device != dev
+    ):
+        raise ValueError(f"perm must be a [B, H, S_k] index tensor on {dev}")
     perm32 = (
         torch.zeros((1,), dtype=torch.int32, device=dev)
         if repair

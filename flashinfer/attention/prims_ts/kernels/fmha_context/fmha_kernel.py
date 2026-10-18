@@ -3138,7 +3138,7 @@ class FmhaTs:
         host with sixteen tiles per group, and the repair tile count, a
         compile-time constant giving how many outlier tiles end the K/V loop of
         an outlier plan. VC-Attention-QK8 also takes the Q and K dequant scales
-        in the sage flat layout and the log2 of the Q scale block.
+        as ``[H, B, blocks]`` tables with one scale per 128-token block.
 
         ``scale_softmax_log2`` and ``output_scale`` must be one-element float32
         device tensors. Example host values are
@@ -3344,13 +3344,13 @@ class FmhaTs:
 
         # VC-Attention-QK16 tile-mean operands, one packed tile per K/V tile.
         tma_mu_desc = tma_v_desc
+        if cutlass.const_expr(
+            cfg.vc_qk8 and (vc_q_scale is None or vc_k_scale is None)
+        ):
+            raise ValueError("VC-Attention-QK8 requires vc_q_scale and vc_k_scale")
         if cutlass.const_expr(cfg.vc_restores_means):
             if cutlass.const_expr(vc_mu is None):
                 raise ValueError("VC-Attention requires vc_mu")
-            if cutlass.const_expr(
-                cfg.vc_qk8 and (vc_q_scale is None or vc_k_scale is None)
-            ):
-                raise ValueError("VC-Attention-QK8 requires vc_q_scale and vc_k_scale")
             mu_rows, mu_cols = vc_mean_operand_shape(cfg.pv_mma_tiler[1])
             tma_mu_desc = cuda.create_tensor_map_tiled_from_view(
                 vc_mu,
