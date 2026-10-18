@@ -105,7 +105,7 @@ def _reference_quantize(
         raise ValueError("k and v must be [B, S, H, D] with matching shapes")
     b, s_k, h, d = k.shape
     if perm is None:
-        perm = vca.vc_token_permutation(v, iters=kmeans_iters, generator=generator)
+        perm = vca.vc_token_permutation(v, iters=kmeans_iters, generator=generator)[0]
     gather_idx = (
         perm.permute(0, 2, 1).unsqueeze(-1).expand(-1, -1, -1, d)
     )  # [B, S, H, D]
@@ -141,7 +141,7 @@ def _reference_quantize(
         v=v8.contiguous(),
         v_scale=v_scale,
         mean=mean,
-        mu=vca.pack_vc_tile_means(mean, v_scale),
+        mu=_pack_tile_means(mean, v_scale),
         perm=perm,
         demean=demean,
     )
@@ -170,7 +170,7 @@ def _reference_quantize_fp8(
         raise ValueError("q, k, v must be [B, S, H, D] with matching batch and heads")
     b, s_k, h, d = k.shape
     if perm is None:
-        perm = vca.vc_token_permutation(v, iters=kmeans_iters, generator=generator)
+        perm = vca.vc_token_permutation(v, iters=kmeans_iters, generator=generator)[0]
     gather_idx = perm.permute(0, 2, 1).unsqueeze(-1).expand(-1, -1, -1, d)
     k_smooth = k.float() - k.float().mean(dim=1, keepdim=True)
     k_p = torch.gather(k_smooth, 1, gather_idx)
@@ -208,7 +208,7 @@ def _reference_quantize_fp8(
         v=v8.contiguous(),
         v_scale=v_scale,
         mean=mean,
-        mu=vca.pack_vc_tile_means(mean, v_scale),
+        mu=_pack_tile_means(mean, v_scale),
         perm=perm,
         demean=demean,
         q=q8.contiguous(),
@@ -270,6 +270,51 @@ def _random_inputs(batch_size, seq_len, num_heads, *, seed=0):
 
 
 _MEAN_CONFIG = VCAttentionConfig()
+
+
+def _pack_tile_means(mean: torch.Tensor, v_scale: torch.Tensor) -> torch.Tensor:
+    """Torch reference of the packed bf16 mean operands the preparation writes.
+
+    Each group of 16 tiles gives two operands in unswizzled tcgen05 K-major
+    core-matrix order. K slots 2i and 2i+1 of operand o hold mean / v_scale of
+    tile 8o+i and the tiles past the sequence are zero.
+    """
+    b, h, t, d = mean.shape
+    vs = v_scale.reshape(b, h, 1, d)
+    m = (mean.float() / vs).to(torch.bfloat16)
+    g = -(-t // vca.VC_MEAN_GROUP_TILES)
+    tiles_per_operand = vca.VC_MEAN_MMA_K // 2
+    rows = torch.zeros(
+        (b, h, g * vca.VC_MEAN_GROUP_TILES, d), dtype=torch.bfloat16, device=mean.device
+    )
+    rows[:, :, :t] = m
+    # Operand o of a group holds its tiles 8o to 8o+7 in K slots 2i and 2i+1.
+    rows = rows.view(
+        b, h, g, vca.VC_MEAN_OPERANDS, tiles_per_operand, d // 8, 8
+    ).permute(0, 1, 2, 3, 5, 6, 4)
+    tile = torch.stack((rows, rows), dim=-1).reshape(
+        b, h, g, vca.VC_MEAN_OPERANDS, d // 8, 8, vca.VC_MEAN_MMA_K
+    )
+    # Core-matrix order of 8-row group, K core matrix, row and k.
+    tile = tile.view(
+        b, h, g, vca.VC_MEAN_OPERANDS, d // 8, 8, 2, vca.VC_MEAN_MMA_K // 2
+    ).permute(0, 1, 2, 3, 4, 6, 5, 7)
+    return tile.reshape(b, h, g, *vca.vc_mean_group_shape(d)).contiguous()
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing (CuTe DSL kernels in kernels/vc_prepare.py)
+# ---------------------------------------------------------------------------
+def _check_prepare_inputs(x: torch.Tensor) -> None:
+    if (
+        x.shape[-1] != 128
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or not x.is_cuda
+    ):
+        raise ValueError(
+            "VC-Attention preparation needs CUDA bf16/fp16 inputs with head_dim 128, "
+            f"got {x.dtype} {tuple(x.shape)} on {x.device}"
+        )
 
 
 def _plan(
@@ -384,7 +429,7 @@ def test_vc_mean_step():
     outs = {}
     for name, value in (("zero", 0.0), ("one", 1.0)):
         mean = torch.full_like(ops.mean, value)
-        mu = vca.pack_vc_tile_means(mean, ops.v_scale)
+        mu = _pack_tile_means(mean, ops.v_scale)
         outs[name] = wrapper.run(q, ops.k, ops.v, vc=replace(ops.params, tile_means=mu))
     torch.testing.assert_close(
         outs["one"].float() - outs["zero"].float(),
@@ -406,7 +451,7 @@ def test_vc_mean_step():
         ),
     )
     out_off = wrapper_off.run(q, plain.k, plain.v, vc=plain.params)
-    zero_mu = vca.pack_vc_tile_means(torch.zeros_like(ops.mean), plain.v_scale)
+    zero_mu = _pack_tile_means(torch.zeros_like(ops.mean), plain.v_scale)
     out_on = wrapper.run(
         q, plain.k, plain.v, vc=replace(plain.params, tile_means=zero_mu)
     )
@@ -553,7 +598,7 @@ def test_one_shot_vc_config_requires_the_operands():
 @pytest.mark.parametrize("batch,seq_len,heads", [(1, 2000, 2), (2, 4096, 4)])
 def test_vc_quantize_fused_matches_reference(batch, seq_len, heads):
     _, k, v = _random_inputs(batch, seq_len, heads)
-    perm = vca.vc_token_permutation(v)
+    perm = vca.vc_token_permutation(v)[0]
     ref = _reference_quantize(k, v, perm=perm)
     fused = vca.vc_quantize(k, v, perm=perm)
     assert torch.equal(fused.k, ref.k)
@@ -569,7 +614,7 @@ def test_vc_quantize_fused_matches_reference(batch, seq_len, heads):
 @pytest.mark.parametrize("batch,seq_len,heads", [(1, 2000, 2), (2, 4096, 4)])
 def test_vc_quantize_fp8_fused_matches_reference(batch, seq_len, heads):
     q, k, v = _random_inputs(batch, seq_len, heads)
-    perm = vca.vc_token_permutation(v)
+    perm = vca.vc_token_permutation(v)[0]
     ref = _reference_quantize_fp8(q, k, v, perm=perm)
     fused = vca.vc_quantize_fp8(q, k, v, perm=perm)
     torch.testing.assert_close(fused.q_scale, ref.q_scale, rtol=1e-6, atol=0)
