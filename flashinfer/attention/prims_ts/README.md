@@ -512,8 +512,10 @@ ops8 = prep.prepare(k_bf16, v_bf16, q=q_bf16, denoise_step=(step, num_steps))
 out8 = wrappers8[ops8.demean].run(ops8.q, ops8.k, ops8.v, vc=ops8.params)
 ```
 
-The one-shot `batch_prefill(..., vc=ops.params)` plans the recipe from the
-operands; `vc_config` without `vc` is rejected.
+The one-shot `batch_prefill(..., vc=ops.params)` plans the tile-mean recipe
+from operands that carry `tile_means`. Operands with `ops.demean == False`
+also need `vc_config=VCAttentionConfig(demean=False)`. V repair operands and
+`vc_config` without `vc` are rejected.
 
 ## Validation
 

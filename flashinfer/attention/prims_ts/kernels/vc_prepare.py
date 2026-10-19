@@ -295,7 +295,7 @@ class VcKvPass1(_Shape):
                 if pos < self.S:
                     out_row = pos + self.shift * Int32(pos >= self.tail)
                     cutlass.inttoptr(
-                        kp_base + out_row * self.row_bytes, mem_space=1, dtype=Int32
+                        kp_base + Int64(out_row) * self.row_bytes, mem_space=1, dtype=Int32
                     ).store(
                         (raw.data_ptr() + i * _WORDS).load(count=_WORDS, alignment=16),
                         alignment=16,
@@ -898,7 +898,7 @@ class VcRepairRowsPass(_Shape):
                         dtype=Int32,
                     ).load()
             if out_row < self.rows:
-                v_dst = v8_base + out_row * self.row_bytes8
+                v_dst = v8_base + Int64(out_row) * self.row_bytes8
                 if tok >= 0:
                     src_off = Int64(tok) * self.row_bytes
                     _load_raw(raw, 0, v_base + src_off)
@@ -920,7 +920,7 @@ class VcRepairRowsPass(_Shape):
                     if cutlass.const_expr(mKOut is not None):
                         _load_raw(raw, 0, k_base + src_off)
                         cutlass.inttoptr(
-                            kout_base + out_row * self.row_bytes,
+                            kout_base + Int64(out_row) * self.row_bytes,
                             mem_space=1,
                             dtype=Int32,
                         ).store(
@@ -933,7 +933,7 @@ class VcRepairRowsPass(_Shape):
                     )
                     if cutlass.const_expr(mKOut is not None):
                         cutlass.inttoptr(
-                            kout_base + out_row * self.row_bytes,
+                            kout_base + Int64(out_row) * self.row_bytes,
                             mem_space=1,
                             dtype=Int32,
                         ).store(
