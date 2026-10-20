@@ -548,13 +548,13 @@ def vc_quantize_repair(
 
     s_k = k.shape[1]
     repair_tiles = vc_repair_tiles(s_k, budget)
-    selected = max(1, round(budget * s_k))
+    repair_tokens = max(1, round(budget * s_k))
     q8, k_all, v_all, q_scale, k_scale, v_scale = vc_prepare_repair(
         None if q is None else q.contiguous(),
         k.contiguous(),
         v.contiguous(),
         repair_tiles=repair_tiles,
-        selected=selected,
+        repair_tokens=repair_tokens,
     )
     return VCAttentionOperands(
         k=k_all,
