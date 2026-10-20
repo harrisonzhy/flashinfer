@@ -33,6 +33,7 @@ from cutlass import Float32, Int32, Int64
 
 from ..vc_attention import (
     E4M3_MAX,
+    VC_HEAD_DIM,
     VC_K_BLOCK_SIZE,
     VC_MEAN_GROUP_TILES,
     VC_MEAN_MMA_K,
@@ -45,16 +46,14 @@ from .fmha_decode.fmha_decode_resources.helpers_common import _pack_float2_to_bf
 from .fmha_decode.fmha_decode_resources.helpers_softmax import _pack_float4_to_fp8_e4m3
 
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
-_D = 128
 _THREADS = 256
-_TILE = VC_K_BLOCK_SIZE
 _COLS = 8
-_COL_GROUPS = _D // _COLS
+_COL_GROUPS = VC_HEAD_DIM // _COLS
 _ROW_GROUPS = _THREADS // _COL_GROUPS
-_ROWS = _TILE // _ROW_GROUPS
+_ROWS = VC_K_BLOCK_SIZE // _ROW_GROUPS
 _WORDS = _COLS // 2
-_MU_ELEMS = math.prod(vc_mean_operand_shape(_D))
-_HADAMARD_NORM = 1.0 / math.sqrt(_D)
+_MU_ELEMS = math.prod(vc_mean_operand_shape(VC_HEAD_DIM))
+_HADAMARD_NORM = 1.0 / math.sqrt(VC_HEAD_DIM)
 _SELECT_BINS = 256
 assert _THREADS == _SELECT_BINS, "VcSelectPass owns one histogram bin per thread"
 
@@ -168,7 +167,11 @@ def _row_base(
     row_bytes: cutlass.Constexpr[int],
 ) -> Int64:
     """Address of this thread's columns of row 0 of batch ``b`` in a ``[B, rows, H, D]`` tensor."""
-    return base + Int64(b) * rows * row_bytes + (Int64(h) * _D + col0) * elem_bytes
+    return (
+        base
+        + Int64(b) * rows * row_bytes
+        + (Int64(h) * VC_HEAD_DIM + col0) * elem_bytes
+    )
 
 
 @cute.jit
@@ -177,7 +180,9 @@ def _store_tile_cols(
 ):
     """Store this thread's 8 columns of tile ``t`` of a ``[B, H, T, D]`` fp32 tensor."""
     cutlass.inttoptr(
-        base + ((Int64(bh) * T + t) * _D + col0) * 4, mem_space=1, dtype=Float32
+        base + ((Int64(bh) * T + t) * VC_HEAD_DIM + col0) * 4,
+        mem_space=1,
+        dtype=Float32,
     ).store(vals.data_ptr().load(count=_COLS, alignment=32), alignment=32)
 
 
@@ -188,15 +193,15 @@ def _cta_col_reduce(
     """Reduce this thread's 8 column values over the row groups through shared memory."""
     cute.arch.sync_threads()
     for j in cutlass.range_constexpr(_COLS):
-        col_sums[rg * _TILE + col0 + j] = vals[j]
+        col_sums[rg * VC_K_BLOCK_SIZE + col0 + j] = vals[j]
     cute.arch.sync_threads()
     for j in cutlass.range_constexpr(_COLS):
         acc = col_sums[col0 + j]
         for g in cutlass.range_constexpr(1, _ROW_GROUPS):
             if cutlass.const_expr(is_max):
-                acc = cute.arch.fmax(acc, col_sums[g * _TILE + col0 + j])
+                acc = cute.arch.fmax(acc, col_sums[g * VC_K_BLOCK_SIZE + col0 + j])
             else:
-                acc = acc + col_sums[g * _TILE + col0 + j]
+                acc = acc + col_sums[g * VC_K_BLOCK_SIZE + col0 + j]
         vals[j] = acc
 
 
@@ -210,7 +215,7 @@ def _stats_addr(
     mStats: cute.Tensor, bh: Int32, slot: cutlass.Constexpr[int], col0: Int32
 ) -> Int64:
     """Slot 0 holds the K channel sums and slot 1 the V residual amax."""
-    return mStats.iterator.toint() + ((Int64(bh) * 2 + slot) * _D + col0) * 4
+    return mStats.iterator.toint() + ((Int64(bh) * 2 + slot) * VC_HEAD_DIM + col0) * 4
 
 
 @cute.jit
@@ -222,7 +227,7 @@ def _scale_slot(
     S: cutlass.Constexpr[int],
 ) -> Int64:
     """Element of block ``block`` of sequence ``bh`` in the ``[H, B, blocks]`` scale table."""
-    blocks = (S + _TILE - 1) // _TILE
+    blocks = (S + VC_K_BLOCK_SIZE - 1) // VC_K_BLOCK_SIZE
     return Int64(bh % H) * (B * blocks) + Int64((bh // H) * blocks + block)
 
 
@@ -234,14 +239,14 @@ class _Shape:
         self.B = B
         self.S = S
         self.H = H
-        self.T = (S + _TILE - 1) // _TILE
+        self.T = (S + VC_K_BLOCK_SIZE - 1) // VC_K_BLOCK_SIZE
         self.R = repair_tiles
         self.repair = repair_tiles > 0
         self.rows = vc_repair_kv_len(S, repair_tiles) if self.repair else S
-        self.tail = S // _TILE * _TILE if self.repair else S
-        self.shift = repair_tiles * _TILE
-        self.row_bytes = H * _D * 2
-        self.row_bytes8 = H * _D
+        self.tail = S // VC_K_BLOCK_SIZE * VC_K_BLOCK_SIZE if self.repair else S
+        self.shift = repair_tiles * VC_K_BLOCK_SIZE
+        self.row_bytes = H * VC_HEAD_DIM * 2
+        self.row_bytes8 = H * VC_HEAD_DIM
 
 
 class VcKvPass1(_Shape):
@@ -262,7 +267,7 @@ class VcKvPass1(_Shape):
     ):
         t, bh, b, h, rg, col0 = _coords(self.H)
         smem = cutlass.utils.SmemAllocator()
-        col_sums = smem.allocate_array(Float32, _ROW_GROUPS * _TILE)
+        col_sums = smem.allocate_array(Float32, _ROW_GROUPS * VC_K_BLOCK_SIZE)
         k_base = _row_base(mK.iterator.toint(), b, self.S, h, col0, 2, self.row_bytes)
         v_base = _row_base(mV.iterator.toint(), b, self.S, h, col0, 2, self.row_bytes)
         if cutlass.const_expr(mKPerm is not None):
@@ -274,7 +279,7 @@ class VcKvPass1(_Shape):
         # of a thread is in flight together.
         toks = cutlass.Array(Int32, _ROWS, space=cutlass.AddressSpace.rmem)
         for i in cutlass.range_constexpr(_ROWS):
-            pos = t * _TILE + rg + _ROW_GROUPS * i
+            pos = t * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
             tok = Int32(0)
             if pos < self.S:
                 tok = pos
@@ -291,11 +296,13 @@ class VcKvPass1(_Shape):
             for i in cutlass.range_constexpr(_ROWS):
                 _load_raw(raw, i * _WORDS, k_base + Int64(toks[i]) * self.row_bytes)
             for i in cutlass.range_constexpr(_ROWS):
-                pos = t * _TILE + rg + _ROW_GROUPS * i
+                pos = t * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
                 if pos < self.S:
                     out_row = pos + self.shift * Int32(pos >= self.tail)
                     cutlass.inttoptr(
-                        kp_base + Int64(out_row) * self.row_bytes, mem_space=1, dtype=Int32
+                        kp_base + Int64(out_row) * self.row_bytes,
+                        mem_space=1,
+                        dtype=Int32,
                     ).store(
                         (raw.data_ptr() + i * _WORDS).load(count=_WORDS, alignment=16),
                         alignment=16,
@@ -307,13 +314,13 @@ class VcKvPass1(_Shape):
             for j in cutlass.range_constexpr(_COLS):
                 ksum[j] = Float32(0.0)
             for i in cutlass.range_constexpr(_ROWS):
-                pos = t * _TILE + rg + _ROW_GROUPS * i
+                pos = t * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
                 kpos = Int32(0)
                 if pos < self.S:
                     kpos = pos
                 _load_raw(raw, i * _WORDS, k_base + Int64(kpos) * self.row_bytes)
             for i in cutlass.range_constexpr(_ROWS):
-                pos = t * _TILE + rg + _ROW_GROUPS * i
+                pos = t * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
                 if pos < self.S:
                     row = _row(raw, i * _WORDS, self.is_bf16)
                     for j in cutlass.range_constexpr(_COLS):
@@ -334,16 +341,16 @@ class VcKvPass1(_Shape):
         for i in cutlass.range_constexpr(_ROWS):
             _load_raw(raw, i * _WORDS, v_base + Int64(toks[i]) * self.row_bytes)
         for i in cutlass.range_constexpr(_ROWS):
-            pos = t * _TILE + rg + _ROW_GROUPS * i
+            pos = t * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
             if pos < self.S:
                 row = _row(raw, i * _WORDS, self.is_bf16)
                 for j in cutlass.range_constexpr(_COLS):
                     psum[j] = psum[j] + row[j]
                     pmax[j] = cute.arch.fmax(pmax[j], row[j])
                     pmin[j] = cute.arch.fmin(pmin[j], row[j])
-        valid_rows = self.S - t * _TILE
-        if valid_rows > _TILE:
-            valid_rows = Int32(_TILE)
+        valid_rows = self.S - t * VC_K_BLOCK_SIZE
+        if valid_rows > VC_K_BLOCK_SIZE:
+            valid_rows = Int32(VC_K_BLOCK_SIZE)
         inv_count = Float32(1.0) / Float32(valid_rows)
         _cta_col_reduce(col_sums, psum, rg, col0, False)
         mean = cutlass.Array(Float32, _COLS, space=cutlass.AddressSpace.rmem)
@@ -376,7 +383,7 @@ class VcKvPass1(_Shape):
         self.kernel(mK, mV, mPerm, mKPerm, mMean, mKSum, mStats).launch(
             grid=[self.T, self.B * self.H, 1],
             block=[_THREADS, 1, 1],
-            smem=_ROW_GROUPS * _TILE * 4,
+            smem=_ROW_GROUPS * VC_K_BLOCK_SIZE * 4,
             stream=stream,
         )
 
@@ -405,9 +412,11 @@ class VcKvPass2(_Shape):
         v_base = (
             mV.iterator.toint()
             + Int64(b) * self.S * self.row_bytes
-            + (Int64(h) * _D + col0) * 2
+            + (Int64(h) * VC_HEAD_DIM + col0) * 2
         )
-        mean_base = mMean.iterator.toint() + (Int64(bh) * self.T + t) * (_D * 4)
+        mean_base = mMean.iterator.toint() + (Int64(bh) * self.T + t) * (
+            VC_HEAD_DIM * 4
+        )
         smem = cutlass.utils.SmemAllocator()
         energy_part = smem.allocate_array(Float32, _THREADS * _ROWS)
 
@@ -420,21 +429,24 @@ class VcKvPass2(_Shape):
             vs_inv[j] = Float32(1.0) / vs[j]
         if (t == 0) & (rg == 0):
             cutlass.inttoptr(
-                mVScale.iterator.toint() + (Int64(bh) * _D + col0) * 4,
+                mVScale.iterator.toint() + (Int64(bh) * VC_HEAD_DIM + col0) * 4,
                 mem_space=1,
                 dtype=Float32,
             ).store(vs.data_ptr().load(count=_COLS, alignment=32), alignment=32)
         if cutlass.const_expr(mKSum is not None):
-            if (t == 0) & (tidx < _D):
+            if (t == 0) & (tidx < VC_HEAD_DIM):
                 ksum_base = (
-                    mKSum.iterator.toint() + (Int64(bh) * self.T * _D + tidx) * 4
+                    mKSum.iterator.toint()
+                    + (Int64(bh) * self.T * VC_HEAD_DIM + tidx) * 4
                 )
                 acc = Float32(0.0)
                 for i in cutlass.range(self.T):
                     acc = (
                         acc
                         + cutlass.inttoptr(
-                            ksum_base + Int64(i) * (_D * 4), mem_space=1, dtype=Float32
+                            ksum_base + Int64(i) * (VC_HEAD_DIM * 4),
+                            mem_space=1,
+                            dtype=Float32,
                         ).load()
                     )
                 cutlass.inttoptr(
@@ -444,7 +456,7 @@ class VcKvPass2(_Shape):
         mean = _load_row_f32(mean_base + col0 * 4)
         raw = cutlass.Array(Int32, _ROWS * _WORDS, space=cutlass.AddressSpace.rmem)
         for i in cutlass.range_constexpr(_ROWS):
-            pos = t * _TILE + rg + _ROW_GROUPS * i
+            pos = t * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
             tok = Int32(0)
             if pos < self.S:
                 tok = pos
@@ -456,7 +468,7 @@ class VcKvPass2(_Shape):
                     ).load()
             _load_raw(raw, i * _WORDS, v_base + Int64(tok) * self.row_bytes)
         for i in cutlass.range_constexpr(_ROWS):
-            pos = t * _TILE + rg + _ROW_GROUPS * i
+            pos = t * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
             energy = Float32(0.0)
             if pos < self.S:
                 row = _row(raw, i * _WORDS, self.is_bf16)
@@ -467,7 +479,7 @@ class VcKvPass2(_Shape):
                 out_addr = (
                     mV8.iterator.toint()
                     + (Int64(b) * self.rows + out_row) * self.row_bytes8
-                    + Int64(h) * _D
+                    + Int64(h) * VC_HEAD_DIM
                     + col0
                 )
                 if cutlass.const_expr(mEnergy is not None):
@@ -490,7 +502,7 @@ class VcKvPass2(_Shape):
         if cutlass.const_expr(mEnergy is not None):
             cute.arch.sync_threads()
             for i in cutlass.range_constexpr(_ROWS):
-                pos = t * _TILE + rg + _ROW_GROUPS * i
+                pos = t * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
                 if (cg == 0) & (pos < self.S):
                     acc = Float32(0.0)
                     for c in cutlass.range_constexpr(_COL_GROUPS):
@@ -593,7 +605,7 @@ class VcQKPass(_Shape):
         super().__init__(is_bf16, B, S, H, repair_tiles)
         self.SQ = SQ
         self.SEL = SEL
-        self.blocks_q = (SQ + _TILE - 1) // _TILE
+        self.blocks_q = (SQ + VC_K_BLOCK_SIZE - 1) // VC_K_BLOCK_SIZE
 
     @cute.jit
     def _block(
@@ -628,7 +640,7 @@ class VcQKPass(_Shape):
         # zero rows. Loads read token 0 for those and the math is skipped.
         toks = cutlass.Array(Int32, _ROWS, space=cutlass.AddressSpace.rmem)
         for i in cutlass.range_constexpr(_ROWS):
-            pos = nb * _TILE + rg + _ROW_GROUPS * i
+            pos = nb * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
             tok = Int32(-1)
             if pos < rows_out:
                 tok = pos
@@ -675,7 +687,7 @@ class VcQKPass(_Shape):
             _hadamard128_row(vals, i * _COLS, cg)
         amax = Float32(0.0)
         for i in cutlass.range_constexpr(_ROWS):
-            pos = nb * _TILE + rg + _ROW_GROUPS * i
+            pos = nb * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
             if pos < rows_out:
                 for j in cutlass.range_constexpr(_COLS):
                     amax = cute.arch.fmax(amax, _abs_f32(vals[i * _COLS + j]))
@@ -695,7 +707,7 @@ class VcQKPass(_Shape):
             mX8.iterator.toint(), b, rows_out, h, col0, 1, self.row_bytes8
         )
         for i in cutlass.range_constexpr(_ROWS):
-            pos = nb * _TILE + rg + _ROW_GROUPS * i
+            pos = nb * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
             if pos < rows_out:
                 cutlass.inttoptr(
                     x8_base + Int64(pos) * self.row_bytes8, mem_space=1, dtype=Int32
@@ -724,7 +736,8 @@ class VcQKPass(_Shape):
                 nb, co, mQ, None, None, None, mQ8, mQScale, red, self.SQ, self.SQ
             )
         elif cutlass.const_expr(mIndex is not None) and (
-            (kb >= self.tail // _TILE) & (kb < self.tail // _TILE + self.R)
+            (kb >= self.tail // VC_K_BLOCK_SIZE)
+            & (kb < self.tail // VC_K_BLOCK_SIZE + self.R)
         ):
             self._block(
                 kb, co, mK, None, mIndex, mStats, mK8, mKScale, red, self.rows, self.S
@@ -739,7 +752,11 @@ class VcQKPass(_Shape):
         self, mQ, mK, mPerm, mIndex, mStats, mQ8, mK8, mQScale, mKScale, stream
     ):
         self.kernel(mQ, mK, mPerm, mIndex, mStats, mQ8, mK8, mQScale, mKScale).launch(
-            grid=[self.blocks_q + (self.rows + _TILE - 1) // _TILE, self.B * self.H, 1],
+            grid=[
+                self.blocks_q + (self.rows + VC_K_BLOCK_SIZE - 1) // VC_K_BLOCK_SIZE,
+                self.B * self.H,
+                1,
+            ],
             block=[_THREADS, 1, 1],
             smem=(_THREADS // 32) * 4,
             stream=stream,
@@ -919,8 +936,8 @@ class VcRepairRowsPass(_Shape):
             tok = Int32(-1)
             out_row = self.S + self.shift + rr
             if j < self.R:
-                out_row = self.tail + j * _TILE + rr
-                sel = j * _TILE + rr
+                out_row = self.tail + j * VC_K_BLOCK_SIZE + rr
+                sel = j * VC_K_BLOCK_SIZE + rr
                 if sel < self.SEL:
                     tok = cutlass.inttoptr(
                         mIndex.iterator.toint() + (Int64(bh) * self.SEL + sel) * 4,
@@ -1099,8 +1116,10 @@ def vc_prepare_fp8(
 ):
     """VC-Attention-QK8 operands ``(q8, k8, v8, q_scale, k_scale, v_scale, mean,
     mu)`` of contiguous ``[B, S, H, D]`` Q, K and V, K and V in ``perm`` order."""
-    if q.shape[-1] != _D or not q.is_contiguous():
-        raise ValueError(f"VC fused preparation needs contiguous head_dim {_D} Q")
+    if q.shape[-1] != VC_HEAD_DIM or not q.is_contiguous():
+        raise ValueError(
+            f"VC fused preparation needs contiguous head_dim {VC_HEAD_DIM} Q"
+        )
     k8, v8, v_scale, mean, mu, q8, q_scale, k_scale = _prepare(
         q, k, v, perm, demean=demean, repair_tiles=0, selected=0
     )
@@ -1119,9 +1138,11 @@ def vc_prepare_repair(
     """V repair operands ``(q8, k_all, v_all, q_scale, k_scale, v_scale)`` in
     input order plus ``repair_tiles`` tiles of the ``selected`` largest-residual
     tokens. The QK8 entries are ``None`` under QK16."""
-    if q is not None and (q.shape[-1] != _D or not q.is_contiguous()):
-        raise ValueError(f"VC fused preparation needs contiguous head_dim {_D} Q")
-    if not 0 < selected <= min(repair_tiles * _TILE, k.shape[1]):
+    if q is not None and (q.shape[-1] != VC_HEAD_DIM or not q.is_contiguous()):
+        raise ValueError(
+            f"VC fused preparation needs contiguous head_dim {VC_HEAD_DIM} Q"
+        )
+    if not 0 < selected <= min(repair_tiles * VC_K_BLOCK_SIZE, k.shape[1]):
         raise ValueError("selected must fit the repair tiles and the sequence")
     k_all, v_all, v_scale, _, _, q8, q_scale, k_scale = _prepare(
         q, k, v, None, demean=False, repair_tiles=repair_tiles, selected=selected
@@ -1133,12 +1154,12 @@ def _prepare(q, k, v, perm, *, demean: bool, repair_tiles: int, selected: int):
     """Run the passes and return ``(k_out, v8, v_scale, mean, mu, q8, q_scale,
     k_scale)``. ``q`` selects QK8 and the QK8 outputs are ``None`` without it."""
     b, s_k, h, d = k.shape
-    if d != _D:
-        raise ValueError(f"VC fused preparation supports head_dim {_D} only")
+    if d != VC_HEAD_DIM:
+        raise ValueError(f"VC fused preparation supports head_dim {VC_HEAD_DIM} only")
     if not (k.is_contiguous() and v.is_contiguous()):
         raise ValueError("k and v must be contiguous")
     dev = k.device
-    t = (s_k + _TILE - 1) // _TILE
+    t = (s_k + VC_K_BLOCK_SIZE - 1) // VC_K_BLOCK_SIZE
     repair = repair_tiles > 0
     rows = vc_repair_kv_len(s_k, repair_tiles) if repair else s_k
     s_q = 0 if q is None else q.shape[1]
@@ -1201,10 +1222,14 @@ def _prepare(q, k, v, perm, *, demean: bool, repair_tiles: int, selected: int):
     k8 = torch.empty((b, rows, h, d), dtype=torch.float8_e4m3fn, device=dev)
     q8 = torch.empty((b, s_q, h, d), dtype=torch.float8_e4m3fn, device=dev)
     k_scale = torch.empty(
-        (h, b, (rows + _TILE - 1) // _TILE), dtype=torch.float32, device=dev
+        (h, b, (rows + VC_K_BLOCK_SIZE - 1) // VC_K_BLOCK_SIZE),
+        dtype=torch.float32,
+        device=dev,
     )
     q_scale = torch.empty(
-        (h, b, (s_q + _TILE - 1) // _TILE), dtype=torch.float32, device=dev
+        (h, b, (s_q + VC_K_BLOCK_SIZE - 1) // VC_K_BLOCK_SIZE),
+        dtype=torch.float32,
+        device=dev,
     )
     ker["qk"](
         flat(q),

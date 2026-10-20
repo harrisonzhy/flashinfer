@@ -57,6 +57,8 @@ from dataclasses import dataclass
 import torch
 
 
+# The head dimension the preparation kernels and the attention plans support.
+VC_HEAD_DIM = 128
 # The K/V tile whose value mean the kernel restores, its only supported size.
 VC_K_BLOCK_SIZE = 128
 # Q tokens per E4M3 Q scale of VC-Attention-QK8, powers of two up to the Q tile.
@@ -403,12 +405,12 @@ def vc_token_permutation(
 # ---------------------------------------------------------------------------
 def _check_prepare_inputs(x: torch.Tensor) -> None:
     if (
-        x.shape[-1] != 128
+        x.shape[-1] != VC_HEAD_DIM
         or x.dtype not in (torch.bfloat16, torch.float16)
         or not x.is_cuda
     ):
         raise ValueError(
-            "VC-Attention preparation needs CUDA bf16/fp16 inputs with head_dim 128, "
+            f"VC-Attention preparation needs CUDA bf16/fp16 inputs with head_dim {VC_HEAD_DIM}, "
             f"got {x.dtype} {tuple(x.shape)} on {x.device}"
         )
 
@@ -720,6 +722,7 @@ def vc_reference(
 
 __all__ = [
     "E4M3_MAX",
+    "VC_HEAD_DIM",
     "VC_K_BLOCK_SIZE",
     "VC_KMEANS_CLUSTERS",
     "VC_KMEANS_ITERS",
