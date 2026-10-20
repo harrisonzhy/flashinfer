@@ -581,53 +581,48 @@ class VcKvPass2(_Shape):
 
 
 class VcQKPass(_Shape):
-    """QK8 quantization of Q or K, one CTA per 128-token block.
+    """QK8 quantization of Q and K in one launch, one CTA per 128-token block.
 
-    ``kind`` is ``q`` for Q, ``k`` for K through ``perm`` or the repair row map,
-    and ``k_repair`` for the repair tiles through the selection index. K is
+    The first ``blocks_q`` blocks are Q, the rest are K through ``perm`` or the
+    repair row map, with the repair tiles through the selection index. K is
     centred with the channel sums of the statistics. The rotated block stays
     in registers between the amax and the store.
     """
 
-    def __init__(
-        self, is_bf16, B, S, H, repair_tiles, kind: str, SQ: int = 0, SEL: int = 0
-    ):
+    def __init__(self, is_bf16, B, S, H, repair_tiles, SQ: int, SEL: int = 0):
         super().__init__(is_bf16, B, S, H, repair_tiles)
-        self.kind = kind
+        self.SQ = SQ
         self.SEL = SEL
-        if kind == "q":
-            self.rows_out = self.src = SQ
-        else:
-            self.rows_out, self.src = self.rows, S
-        self.block0 = self.tail // _TILE if kind == "k_repair" else 0
-        self.blocks = (
-            self.R if kind == "k_repair" else (self.rows_out + _TILE - 1) // _TILE
-        )
+        self.blocks_q = (SQ + _TILE - 1) // _TILE
 
-    @cute.kernel
-    def kernel(
+    @cute.jit
+    def _block(
         self,
+        nb: Int32,
+        co,
         mX: cute.Tensor,
         mPerm: cute.Tensor | None,
         mIndex: cute.Tensor | None,
         mStats: cute.Tensor | None,
         mX8: cute.Tensor,
         mScale: cute.Tensor,
+        red,
+        rows_out: cutlass.Constexpr[int],
+        src: cutlass.Constexpr[int],
     ):
-        nb, bh, b, h, rg, col0 = _coords(self.H)
-        nb = nb + self.block0
+        """One block of Q, of K when ``mStats`` is given, or of the repair tiles
+        when ``mIndex`` is given. ``co`` carries the CTA and thread coordinates."""
+        _, bh, b, h, rg, col0 = co
         cg = col0 // _COLS
         tidx = rg * _COL_GROUPS + cg
-        smem = cutlass.utils.SmemAllocator()
-        red = smem.allocate_array(Float32, _THREADS // 32)
-        x_base = _row_base(mX.iterator.toint(), b, self.src, h, col0, 2, self.row_bytes)
+        x_base = _row_base(mX.iterator.toint(), b, src, h, col0, 2, self.row_bytes)
         centre = cutlass.Array(Float32, _COLS, space=cutlass.AddressSpace.rmem)
         for j in cutlass.range_constexpr(_COLS):
             centre[j] = Float32(0.0)
         if cutlass.const_expr(mStats is not None):
             c = _load_row_f32(_stats_addr(mStats, bh, 0, col0))
             for j in cutlass.range_constexpr(_COLS):
-                centre[j] = c[j] * Float32(1.0 / self.src)
+                centre[j] = c[j] * Float32(1.0 / src)
 
         # Source token per row, with -1 for rows outside the sequence and for
         # zero rows. Loads read token 0 for those and the math is skipped.
@@ -635,7 +630,7 @@ class VcQKPass(_Shape):
         for i in cutlass.range_constexpr(_ROWS):
             pos = nb * _TILE + rg + _ROW_GROUPS * i
             tok = Int32(-1)
-            if pos < self.rows_out:
+            if pos < rows_out:
                 tok = pos
                 if cutlass.const_expr(mIndex is not None):
                     tok = Int32(-1)
@@ -652,7 +647,7 @@ class VcQKPass(_Shape):
                         mem_space=1,
                         dtype=Int32,
                     ).load()
-                elif cutlass.const_expr(self.kind == "k" and self.repair):
+                elif cutlass.const_expr(mStats is not None and self.repair):
                     if pos >= self.tail:
                         tok = Int32(-1)
                         if (pos >= self.tail + self.shift) & (
@@ -681,7 +676,7 @@ class VcQKPass(_Shape):
         amax = Float32(0.0)
         for i in cutlass.range_constexpr(_ROWS):
             pos = nb * _TILE + rg + _ROW_GROUPS * i
-            if pos < self.rows_out:
+            if pos < rows_out:
                 for j in cutlass.range_constexpr(_COLS):
                     amax = cute.arch.fmax(amax, _abs_f32(vals[i * _COLS + j]))
         amax = _block_max(amax, red, tidx)
@@ -691,25 +686,60 @@ class VcQKPass(_Shape):
         if tidx == 0:
             cutlass.inttoptr(
                 mScale.iterator.toint()
-                + _scale_slot(bh, nb, self.H, self.B, self.rows_out) * 4,
+                + _scale_slot(bh, nb, self.H, self.B, rows_out) * 4,
                 mem_space=1,
                 dtype=Float32,
             ).store(scale)
         scale_inv = Float32(_HADAMARD_NORM) / scale
         x8_base = _row_base(
-            mX8.iterator.toint(), b, self.rows_out, h, col0, 1, self.row_bytes8
+            mX8.iterator.toint(), b, rows_out, h, col0, 1, self.row_bytes8
         )
         for i in cutlass.range_constexpr(_ROWS):
             pos = nb * _TILE + rg + _ROW_GROUPS * i
-            if pos < self.rows_out:
+            if pos < rows_out:
                 cutlass.inttoptr(
                     x8_base + Int64(pos) * self.row_bytes8, mem_space=1, dtype=Int32
                 ).store(_pack_row_fp8(vals, i * _COLS, scale_inv), alignment=8)
 
+    @cute.kernel
+    def kernel(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mPerm: cute.Tensor | None,
+        mIndex: cute.Tensor | None,
+        mStats: cute.Tensor,
+        mQ8: cute.Tensor,
+        mK8: cute.Tensor,
+        mQScale: cute.Tensor,
+        mKScale: cute.Tensor,
+    ):
+        co = _coords(self.H)
+        nb = co[0]
+        smem = cutlass.utils.SmemAllocator()
+        red = smem.allocate_array(Float32, _THREADS // 32)
+        kb = nb - self.blocks_q
+        if nb < self.blocks_q:
+            self._block(
+                nb, co, mQ, None, None, None, mQ8, mQScale, red, self.SQ, self.SQ
+            )
+        elif cutlass.const_expr(mIndex is not None) and (
+            (kb >= self.tail // _TILE) & (kb < self.tail // _TILE + self.R)
+        ):
+            self._block(
+                kb, co, mK, None, mIndex, mStats, mK8, mKScale, red, self.rows, self.S
+            )
+        else:
+            self._block(
+                kb, co, mK, mPerm, None, mStats, mK8, mKScale, red, self.rows, self.S
+            )
+
     @cute.jit
-    def __call__(self, mX, mPerm, mIndex, mStats, mX8, mScale, stream):
-        self.kernel(mX, mPerm, mIndex, mStats, mX8, mScale).launch(
-            grid=[self.blocks, self.B * self.H, 1],
+    def __call__(
+        self, mQ, mK, mPerm, mIndex, mStats, mQ8, mK8, mQScale, mKScale, stream
+    ):
+        self.kernel(mQ, mK, mPerm, mIndex, mStats, mQ8, mK8, mQScale, mKScale).launch(
+            grid=[self.blocks_q + (self.rows + _TILE - 1) // _TILE, self.B * self.H, 1],
             block=[_THREADS, 1, 1],
             smem=(_THREADS // 32) * 4,
             stream=stream,
@@ -1032,40 +1062,20 @@ def _compiled(
             options=_COMPILE_OPTIONS,
         )
     if qk8:
-        k["q"] = cute.compile(
-            VcQKPass(*shape, "q", SQ=SQ),
+        k["qk"] = cute.compile(
+            VcQKPass(*shape, SQ, SEL),
             x16(),
-            None,
-            None,
-            None,
-            e4m3(),
-            f32(),
-            stream,
-            options=_COMPILE_OPTIONS,
-        )
-        k["k"] = cute.compile(
-            VcQKPass(*shape, "k"),
             x16(),
             perm,
-            None,
+            i32() if repair else None,
             f32(),
             e4m3(),
+            e4m3(),
+            f32(),
             f32(),
             stream,
             options=_COMPILE_OPTIONS,
         )
-        if repair:
-            k["k_repair"] = cute.compile(
-                VcQKPass(*shape, "k_repair", SEL=SEL),
-                x16(),
-                None,
-                i32(),
-                f32(),
-                e4m3(),
-                f32(),
-                stream,
-                options=_COMPILE_OPTIONS,
-            )
     return k
 
 
@@ -1196,10 +1206,15 @@ def _prepare(q, k, v, perm, *, demean: bool, repair_tiles: int, selected: int):
     q_scale = torch.empty(
         (h, b, (s_q + _TILE - 1) // _TILE), dtype=torch.float32, device=dev
     )
-    ker["k"](flat(k), flat(perm32), None, flat(stats), flat(k8), flat(k_scale))
-    if repair:
-        ker["k_repair"](
-            flat(k), None, flat(index), flat(stats), flat(k8), flat(k_scale)
-        )
-    ker["q"](flat(q), None, None, None, flat(q8), flat(q_scale))
+    ker["qk"](
+        flat(q),
+        flat(k),
+        flat(perm32),
+        flat(index),
+        flat(stats),
+        flat(q8),
+        flat(k8),
+        flat(q_scale),
+        flat(k_scale),
+    )
     return k8, v8, v_scale, mean, mu, q8, q_scale, k_scale
