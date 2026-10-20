@@ -725,15 +725,19 @@ def test_vc_preprocessor_step_schedule():
     ).transpose(1, 2)
     step0 = prep.prepare(k, v, denoise_step=(0, 40))
     assert step0.demean
+    perm0 = step0.perm.clone()
     out = wrapper.run(q, step0.k, step0.v, vc=step0.params)
     assert (
         _relative_error(out.float(), vca.vc_reference(q, step0, sm_scale=sm_scale))
         < 6e-2
     )
     step1 = prep.prepare(k, v, denoise_step=(1, 40))
-    assert torch.equal(step1.perm, step0.perm)  # no refresh at step 1
+    assert torch.equal(step1.perm, perm0)  # no refresh at step 1
+    perm_ptr = prep._groupings[(1, 1024, 2)]["perm"].data_ptr()
     step4 = prep.prepare(k, v.flip(1), denoise_step=(4, 40))
-    assert not torch.equal(step4.perm, step0.perm)  # refreshed at step 4
+    assert not torch.equal(step4.perm, perm0)  # refreshed at step 4
+    # The new grouping lands in the existing buffer so a captured CUDA graph reads it.
+    assert prep._groupings[(1, 1024, 2)]["perm"].data_ptr() == perm_ptr
     late = prep.prepare(k, v, denoise_step=(20, 40))  # V-Smooth off
     assert not late.demean
     assert torch.equal(late.perm, step4.perm)

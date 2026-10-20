@@ -54,6 +54,8 @@ import functools
 import math
 from dataclasses import dataclass
 
+from typing import Any
+
 import torch
 
 
@@ -606,7 +608,7 @@ class VCAttentionPreprocessor:
         self.kmeans_clusters = kmeans_clusters
         self.kmeans_iters = kmeans_iters
         # Per (batch, seq_len_k, num_kv_heads): perm, centroids, step of the last refresh.
-        self._groupings: dict[tuple[int, int, int], dict[str, object]] = {}
+        self._groupings: dict[tuple[int, int, int], dict[str, Any]] = {}
 
     @torch.no_grad()
     @torch.compiler.disable
@@ -649,12 +651,20 @@ class VCAttentionPreprocessor:
                     iters=self.kmeans_iters,
                     init_centroids=None if entry is None else entry["centroids"],
                 )
-                entry = {
-                    "perm": perm.to(torch.int32),
-                    "centroids": centroids,
-                    "step": None if denoise_step is None else denoise_step[0],
-                }
-                self._groupings[key] = entry
+                step = None if denoise_step is None else denoise_step[0]
+                if entry is None:
+                    entry = {
+                        "perm": perm.to(torch.int32),
+                        "centroids": centroids,
+                        "step": step,
+                    }
+                    self._groupings[key] = entry
+                else:
+                    # The buffers keep their addresses, so a CUDA graph captured around one call
+                    # reads the grouping that later calls or replays write into them.
+                    entry["perm"].copy_(perm.to(torch.int32))
+                    entry["centroids"].copy_(centroids)
+                    entry["step"] = step
             perm = entry["perm"]
         elif entry is not None:
             # V-Smooth off (paper Section 3.4). The plain kernel runs on the last
