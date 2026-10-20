@@ -33,6 +33,13 @@ Schedule phase terms follow TS schedule-builder naming. HEAD is the one-time
 schedule before the repeated K/V tile loop, LOOP is the repeated K/V tile body,
 and TAIL is the one-time cleanup and drain after LOOP exits.
 
+VC-Attention is the low-bit attention recipe of Li et al. 2026, arXiv
+2609.15810, value smoothing with a softmax cast. Names with the ``vc`` prefix
+belong to its recipes: QK16 keeps bf16 Q and K, QK8 adds centred, Hadamard
+rotated E4M3 Q and K with block scales, and both store E4M3 V as residuals
+around each 128-token tile mean, which the kernel restores inside the online
+softmax.
+
 Feature Support Matrix:
 
   | Feature          | Support                                                                                       |
@@ -1092,9 +1099,13 @@ def build_context_task_manager(
             name="smem_v",
             **kv_resource_kwargs,
         )
-    # Mu is the per-tile mean of V. It is a UMMA operand like K and V,
-    # so it must sit in shared memory. The load warp stages it beside
-    # each V tile and the UMMA warp consumes it.
+    # Mu is the per-tile mean of V. V tile t is stored as E4M3 residuals
+    # V8_t = V_t - mu_t, so the PV product splits into
+    #   O = sum_t P_t V8_t + sum_t rowsum(P_t) mu_t
+    # and the second term is a bf16 K=16 UMMA per group of sixteen tiles with
+    # the row sums as A and the means as B. Mu is therefore a UMMA operand
+    # like K and V and must sit in shared memory. The load warp stages it
+    # beside each V tile and the UMMA warp consumes it.
     smem_mu: SmemMuResource | None = None
     if cfg.vc_restores_means:
         smem_mu_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(

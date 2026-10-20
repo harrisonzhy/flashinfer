@@ -31,9 +31,18 @@ pytest.importorskip(
 from flashinfer.attention.prims_ts import (
     BatchPrefillTSWrapper,
     VCAttentionConfig,
-    VCAttentionPreprocessor,
     batch_prefill,
     vc_attention as vca,
+)
+from flashinfer.attention.prims_ts.vc_quantization import (
+    VC_KMEANS_ITERS,
+    VCAttentionOperands,
+    VCAttentionPreprocessor,
+    hadamard_matrix,
+    vc_quantize,
+    vc_quantize_fp8,
+    vc_quantize_repair,
+    vc_token_permutation,
 )
 
 from tests.attention.test_attention_ts_context import _REQUIRES_CONTEXT_GPU
@@ -89,10 +98,10 @@ def _reference_quantize(
     v: torch.Tensor,
     *,
     perm: torch.Tensor | None = None,
-    kmeans_iters: int = vca.VC_KMEANS_ITERS,
+    kmeans_iters: int = VC_KMEANS_ITERS,
     generator: torch.Generator | None = None,
     demean: bool = True,
-) -> vca.VCAttentionOperands:
+) -> VCAttentionOperands:
     """Turn ``[B, S, H, D]`` K/V into VC-Attention-QK16 kernel operands.
 
     Keys are permuted with the values and kept in their dtype. Values are
@@ -105,7 +114,7 @@ def _reference_quantize(
         raise ValueError("k and v must be [B, S, H, D] with matching shapes")
     b, s_k, h, d = k.shape
     if perm is None:
-        perm = vca.vc_token_permutation(v, iters=kmeans_iters, generator=generator)[0]
+        perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)[0]
     gather_idx = (
         perm.permute(0, 2, 1).unsqueeze(-1).expand(-1, -1, -1, d)
     )  # [B, S, H, D]
@@ -136,7 +145,7 @@ def _reference_quantize(
     )  # [B, H, D]
     v8 = (residual / v_scale.unsqueeze(1)).to(torch.float8_e4m3fn)
     mean = mean.permute(0, 2, 1, 3).contiguous()  # [B, H, T, D]
-    return vca.VCAttentionOperands(
+    return VCAttentionOperands(
         k=k_p.contiguous(),
         v=v8.contiguous(),
         v_scale=v_scale,
@@ -154,10 +163,10 @@ def _reference_quantize_fp8(
     v: torch.Tensor,
     *,
     perm: torch.Tensor | None = None,
-    kmeans_iters: int = vca.VC_KMEANS_ITERS,
+    kmeans_iters: int = VC_KMEANS_ITERS,
     generator: torch.Generator | None = None,
     demean: bool = True,
-) -> vca.VCAttentionOperands:
+) -> VCAttentionOperands:
     """Turn ``[B, S, H, D]`` Q/K/V into VC-Attention-QK8 kernel operands.
 
     Keys are centred by their per-(batch, head) channel mean over tokens
@@ -170,12 +179,12 @@ def _reference_quantize_fp8(
         raise ValueError("q, k, v must be [B, S, H, D] with matching batch and heads")
     b, s_k, h, d = k.shape
     if perm is None:
-        perm = vca.vc_token_permutation(v, iters=kmeans_iters, generator=generator)[0]
+        perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)[0]
     gather_idx = perm.permute(0, 2, 1).unsqueeze(-1).expand(-1, -1, -1, d)
     k_smooth = k.float() - k.float().mean(dim=1, keepdim=True)
     k_p = torch.gather(k_smooth, 1, gather_idx)
     v_p = torch.gather(v.float(), 1, gather_idx)
-    hm = vca.hadamard_matrix(d, q.device)
+    hm = hadamard_matrix(d, q.device)
     q_f = q.float() @ hm
     k_p = k_p @ hm
     q_scale = _block_amax_scale(q_f, vca.VC_K_BLOCK_SIZE)
@@ -203,7 +212,7 @@ def _reference_quantize_fp8(
     v_scale = (residual.abs().amax(dim=1) / vca.E4M3_MAX).clamp_min(1e-12).float()
     v8 = (residual / v_scale.unsqueeze(1)).to(torch.float8_e4m3fn)
     mean = mean.permute(0, 2, 1, 3).contiguous()  # [B, H, T, D]
-    return vca.VCAttentionOperands(
+    return VCAttentionOperands(
         k=k8.contiguous(),
         v=v8.contiguous(),
         v_scale=v_scale,
@@ -339,12 +348,12 @@ def _plan(
 
 def _quantize(case: _VCCase, q, k, v):
     if case.repair_budget:
-        return vca.vc_quantize_repair(
+        return vc_quantize_repair(
             k, v, budget=case.repair_budget, q=q if case.qk_dtype == _FP8 else None
         )
     if case.qk_dtype == _FP8:
-        return vca.vc_quantize_fp8(q, k, v)
-    return vca.vc_quantize(k, v)
+        return vc_quantize_fp8(q, k, v)
+    return vc_quantize(k, v)
 
 
 def _run_case(case: _VCCase):
@@ -441,7 +450,7 @@ def test_vc_mean_step():
     with demean off equals the means plan fed zero tile means and differs from a
     run whose means are non-zero."""
     q, k, v = _random_inputs(1, 1024, 2)
-    ops = vca.vc_quantize(k, v)
+    ops = vc_quantize(k, v)
     wrapper = BatchPrefillTSWrapper()
     _plan(wrapper, batch_size=1, seq_len=1024, num_heads=2)
     outs = {}
@@ -455,7 +464,7 @@ def test_vc_mean_step():
         rtol=0,
         atol=1.6e-2,
     )
-    plain = vca.vc_quantize(k, v, perm=ops.perm, demean=False)
+    plain = vc_quantize(k, v, perm=ops.perm, demean=False)
     assert plain.params.tile_means is None
     wrapper_off = BatchPrefillTSWrapper()
     _plan(
@@ -548,7 +557,7 @@ def test_vc_kernel_config_rejects_invalid_profiles():
 @_REQUIRES_CONTEXT_GPU
 def test_vc_run_rejects_mismatched_operands():
     q, k, v = _random_inputs(1, 1024, 2)
-    ops = vca.vc_quantize(k, v)
+    ops = vc_quantize(k, v)
     wrapper = BatchPrefillTSWrapper()
     _plan(wrapper, batch_size=1, seq_len=1024, num_heads=2)
     good = ops.params
@@ -573,7 +582,7 @@ def test_vc_run_rejects_mismatched_operands():
     _plan(plain, batch_size=1, seq_len=1024, num_heads=2, vc_config=None)
     with pytest.raises(ValueError, match="rejected by a plan without"):
         plain.run(q, ops.k, ops.v, vc=good)
-    ops8 = vca.vc_quantize_fp8(q, k, v)
+    ops8 = vc_quantize_fp8(q, k, v)
     with pytest.raises(ValueError, match="belong to VC-Attention-QK8"):
         wrapper.run(q, ops.k, ops.v, vc=replace(good, k_scale=ops8.k_scale))
     qk8 = BatchPrefillTSWrapper()
@@ -596,7 +605,7 @@ def test_one_shot_vc_config_requires_the_operands():
     with pytest.raises(ValueError, match="vc_config requires"):
         batch_prefill(q, q, q.to(_FP8), vc_config=VCAttentionConfig())
     q, k, v = _random_inputs(1, 1024, 2)
-    repair = vca.vc_quantize_repair(k, v, budget=0.02)
+    repair = vc_quantize_repair(k, v, budget=0.02)
     with pytest.raises(NotImplementedError, match="does not run V repair"):
         batch_prefill(q, repair.k, repair.v, vc=repair.params)
     with pytest.raises(NotImplementedError, match="does not run V repair"):
@@ -616,9 +625,9 @@ def test_one_shot_vc_config_requires_the_operands():
 @pytest.mark.parametrize("batch,seq_len,heads", [(1, 2000, 2), (2, 4096, 4)])
 def test_vc_quantize_fused_matches_reference(batch, seq_len, heads):
     _, k, v = _random_inputs(batch, seq_len, heads)
-    perm = vca.vc_token_permutation(v)[0]
+    perm = vc_token_permutation(v)[0]
     ref = _reference_quantize(k, v, perm=perm)
-    fused = vca.vc_quantize(k, v, perm=perm)
+    fused = vc_quantize(k, v, perm=perm)
     assert torch.equal(fused.k, ref.k)
     torch.testing.assert_close(fused.v_scale, ref.v_scale, rtol=1e-6, atol=0)
     torch.testing.assert_close(fused.mean, ref.mean, rtol=1e-5, atol=1e-6)
@@ -632,9 +641,9 @@ def test_vc_quantize_fused_matches_reference(batch, seq_len, heads):
 @pytest.mark.parametrize("batch,seq_len,heads", [(1, 2000, 2), (2, 4096, 4)])
 def test_vc_quantize_fp8_fused_matches_reference(batch, seq_len, heads):
     q, k, v = _random_inputs(batch, seq_len, heads)
-    perm = vca.vc_token_permutation(v)[0]
+    perm = vc_token_permutation(v)[0]
     ref = _reference_quantize_fp8(q, k, v, perm=perm)
-    fused = vca.vc_quantize_fp8(q, k, v, perm=perm)
+    fused = vc_quantize_fp8(q, k, v, perm=perm)
     torch.testing.assert_close(fused.q_scale, ref.q_scale, rtol=1e-6, atol=0)
     torch.testing.assert_close(fused.k_scale, ref.k_scale, rtol=1e-6, atol=0)
     torch.testing.assert_close(fused.v_scale, ref.v_scale, rtol=1e-6, atol=0)
@@ -657,7 +666,7 @@ def test_vc_quantize_repair_matches_torch_selection(batch, seq_len, heads):
     zero rows."""
     _, k, v = _random_inputs(batch, seq_len, heads)
     budget = 0.02
-    ops = vca.vc_quantize_repair(k, v, budget=budget)
+    ops = vc_quantize_repair(k, v, budget=budget)
     selected = max(1, round(budget * seq_len))
     whole = seq_len // vca.VC_K_BLOCK_SIZE * vca.VC_K_BLOCK_SIZE
     shift = ops.repair_tiles * vca.VC_K_BLOCK_SIZE
@@ -700,7 +709,7 @@ def test_vc_quantize_repair_matches_torch_selection(batch, seq_len, heads):
 
 
 def test_vc_hadamard_is_orthonormal_and_qk_invariant():
-    hm = vca.hadamard_matrix(_HEAD_DIM, torch.device("cpu"))
+    hm = hadamard_matrix(_HEAD_DIM, torch.device("cpu"))
     torch.testing.assert_close(hm @ hm.T, torch.eye(_HEAD_DIM), atol=1e-5, rtol=0)
     torch.manual_seed(0)
     q = torch.randn(1, 512, 2, _HEAD_DIM)
@@ -758,4 +767,4 @@ def test_vc_preprocessor_step_schedule():
     # The same schedule drives the QK8 preparation, which also returns E4M3 Q.
     qk8 = VCAttentionPreprocessor().prepare(k, v, q=q, denoise_step=(0, 40))
     assert qk8.q.dtype == _FP8 and qk8.q_scale is not None and qk8.demean
-    assert torch.equal(qk8.v_scale, vca.vc_quantize_fp8(q, k, v, perm=qk8.perm).v_scale)
+    assert torch.equal(qk8.v_scale, vc_quantize_fp8(q, k, v, perm=qk8.perm).v_scale)

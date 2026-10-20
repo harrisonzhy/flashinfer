@@ -449,8 +449,8 @@ turns bf16 K/V (and Q under QK8) into the operands with the paper's V-Smooth
 schedule: grouping and demeaning run on the first `smooth_step_fraction` of the
 denoising steps, the permutation is refreshed every `perm_refresh_every` steps
 inside that window and kept afterwards. `vc_quantize` and `vc_quantize_fp8` are
-the two preparations (CuTe DSL kernels in `kernels/vc_prepare.py`; bf16/fp16
-inputs with `head_dim=128`).
+the two preparations (bf16/fp16 inputs with `head_dim=128`). The quantizer
+lives in `flashinfer.quantization`; this module holds the operand contract.
 
 | Input | Supported values |
 | --- | --- |
