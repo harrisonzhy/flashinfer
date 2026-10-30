@@ -53,6 +53,8 @@ from .sage import SageAttentionConfig, SageAttentionParams
 from .vc_attention import (
     VCAttentionConfig,
     VCAttentionParams,
+)
+from .vc_attention.quantization import (
     VCAttentionPreprocessor,
 )
 
