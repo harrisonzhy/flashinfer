@@ -824,11 +824,11 @@ def test_vc_preprocessor_step_schedule():
     )
     step1 = prep.prepare(k, v, denoise_step=(1, 40))
     assert torch.equal(step1.perm, perm0)  # no refresh at step 1
-    perm_ptr = prep._groupings[(1, 1024, 2)]["perm"].data_ptr()
+    perm_ptr = prep._groupings[(1, 1024, 2, None)]["perm"].data_ptr()
     step4 = prep.prepare(k, v.flip(1), denoise_step=(4, 40))
     assert not torch.equal(step4.perm, perm0)  # refreshed at step 4
     # The new grouping lands in the existing buffer so a captured CUDA graph reads it.
-    assert prep._groupings[(1, 1024, 2)]["perm"].data_ptr() == perm_ptr
+    assert prep._groupings[(1, 1024, 2, None)]["perm"].data_ptr() == perm_ptr
     late = prep.prepare(k, v, denoise_step=(20, 40))  # V-Smooth off
     assert not late.demean
     assert torch.equal(late.perm, step4.perm)
@@ -850,3 +850,16 @@ def test_vc_preprocessor_step_schedule():
     qk8 = VCAttentionPreprocessor().prepare(k, v, q=q, denoise_step=(0, 40))
     assert qk8.q.dtype == _QK8 and qk8.q_scale is not None and qk8.demean
     assert torch.equal(qk8.v_scale, vc_quantize_fp8(q, k, v, perm=qk8.perm).v_scale)
+
+
+@_REQUIRES_CONTEXT_GPU
+def test_vc_preprocessor_groups_only_the_given_tokens():
+    """Only the given range is grouped; the other tokens follow it in input order."""
+    _, _, v = _random_inputs(1, 1000, 2)
+    perm = VCAttentionPreprocessor().prepare(v, v, grouped_tokens=(200, 900)).perm
+    rest = torch.cat([torch.arange(0, 200), torch.arange(900, 1000)]).to(perm)
+    assert torch.equal(
+        perm[..., :700].sort(dim=-1).values,
+        torch.arange(200, 900).to(perm).expand(1, 2, -1),
+    )
+    assert torch.equal(perm[..., 700:], rest.expand(1, 2, -1))
