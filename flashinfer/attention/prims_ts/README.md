@@ -454,7 +454,12 @@ batch element and head shares them. A generation depends neither on the previous
 one nor on the other elements of the batch. The caller's global generator is
 untouched. A CUDA graph runner that replays one graph per step kind passes
 `prepare(..., mode=...)` with `cold`, `warm`, `keep` or `plain` in place of a
-step. `vc_quantize` and `vc_quantize_fp8` are
+step. For a joint sequence pass
+`prepare(..., grouped_tokens=(start, stop))` with the video token range. Only
+those tokens are grouped. The text or audio tokens follow them in input order. A
+text key grouped among the video keys would precede the long video tail in the
+rows attending to it. That tail would round to zero against the row maximum.
+`vc_quantize` and `vc_quantize_fp8` are
 the two preparations (bf16/fp16 inputs with `head_dim=128`). The quantizer
 lives in `flashinfer.quantization`; this module holds the operand contract.
 
