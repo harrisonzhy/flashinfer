@@ -802,9 +802,21 @@ def test_vc_preprocessor_step_schedule():
     exact = torch.nn.functional.scaled_dot_product_attention(
         q.float().transpose(1, 2), k.float().transpose(1, 2), v.float().transpose(1, 2)
     ).transpose(1, 2)
+    rng_state = torch.cuda.get_rng_state()
     step0 = prep.prepare(k, v, denoise_step=(0, 40))
     assert step0.demean
     perm0 = step0.perm.clone()
+    # The k-means draws from the preprocessor's own generator, not the caller's.
+    assert torch.equal(torch.cuda.get_rng_state(), rng_state)
+    # Step 0 cold-starts every generation from the same seed: the grouping does
+    # not depend on the generation before it or on the other batch elements.
+    assert torch.equal(
+        VCAttentionPreprocessor().prepare(k, v, denoise_step=(0, 40)).perm, perm0
+    )
+    batched = VCAttentionPreprocessor().prepare(
+        torch.cat([k, k.flip(1)]), torch.cat([v, v.flip(1)]), denoise_step=(0, 40)
+    )
+    assert torch.equal(batched.perm[:1], perm0)
     out = wrapper.run(q, step0.k, step0.v, vc=step0.params)
     assert (
         _relative_error(out.float(), vca.vc_reference(q, step0, sm_scale=sm_scale))
