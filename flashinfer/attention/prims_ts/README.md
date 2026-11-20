@@ -706,7 +706,8 @@ text key grouped among the video keys would precede the long video tail in the
 rows attending to it. That tail would round to zero against the row maximum.
 `vc_quantize` and `vc_quantize_fp8` are the two preparations (bf16/fp16 inputs
 with `head_dim=128`). QK16 plans require bf16 Q/K; QK8 preparation accepts bf16
-or fp16 inputs and produces E4M3 Q/K.
+or fp16 inputs and produces E4M3 (`vc_quantize_fp8`) or INT8 (`vc_quantize_int8`)
+Q/K codes.
 The quantizers live in
 `flashinfer.attention.prims_ts.vc_attention.quantization`; the `vc_attention`
 package holds the operand contract.
